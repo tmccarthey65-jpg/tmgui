@@ -60,9 +60,9 @@ $mw->geometry("1200x800");
 
 # Variables
 my $selected_share = '';
-my $local_path = $ENV{HOME};
+my $local_path = '/home/timmccarthey/Public';
 my $remote_path = '';
-my $local_sort = 'Name';
+my $local_sort = 'Date (Newest)';
 
 # Declare widgets that will be created later
 my ($local_listbox, $remote_listbox, $local_info, $remote_info, $status_label);
