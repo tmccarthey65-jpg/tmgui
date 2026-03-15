@@ -24,16 +24,20 @@ sub is_mounted {
 }
 
 if ($action eq 'mt') {
-    is_mounted()
-        ? print "Already mounted\n"
-        : system('sudo', 'mount', '-t', 'cifs',
-                 $cfg{share}, $cfg{mount},
-                 '-o', $cfg{opts});
+    if (is_mounted()) {
+        print "Already mounted\n";
+    } else {
+        system('sudo', 'mount', '-t', 'cifs', $cfg{share}, $cfg{mount}, '-o', $cfg{opts});
+        is_mounted() ? print "Mounted successfully\n" : warn "Mount failed!\n";
+    }
 }
 elsif ($action eq 'umt') {
-    is_mounted()
-        ? system('sudo', 'umount', $cfg{mount})
-        : print "Not mounted\n";
+    if (!is_mounted()) {
+        print "Not mounted\n";
+    } else {
+        system('sudo', 'umount', $cfg{mount});
+        is_mounted() ? warn "Unmount failed!\n" : print "Unmounted successfully\n";
+    }
 }
 else {
     die "Invalid action: use mt or umt\n";
