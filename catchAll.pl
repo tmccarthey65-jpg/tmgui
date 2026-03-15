@@ -82,7 +82,11 @@ sub mount_share {
            $cfg->{share}, $cfg->{mount},
            '-o', $opts);
 
-    print "Mounted: $name\n" if is_mounted($cfg->{mount});
+    if (is_mounted($cfg->{mount})) {
+        print "Mounted: $name\n";
+    } else {
+        warn "Mount failed: $name\n";
+    }
 }
 
 sub unmount_share {
