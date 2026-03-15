@@ -100,7 +100,13 @@ sub unmount_share {
 sub tmdb_search {
     my ($movie_title) = @_;
 
-    my $api_key = 'REDACTED_TMDB_API_KEY';
+    my $api_key = $ENV{TMDB_API_KEY};
+    unless ($api_key) {
+        my $key_file = "$ENV{HOME}/.tmdb-api-key";
+        open(my $fh, '<', $key_file) or die "No TMDB_API_KEY env var and cannot read $key_file: $!\n";
+        chomp($api_key = <$fh>);
+        close($fh);
+    }
     $movie_title =~ s/ /%20/g;
 
     my $ua = LWP::UserAgent->new;
