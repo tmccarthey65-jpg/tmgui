@@ -4,7 +4,6 @@ use strict;
 use warnings;
 use Tk;
 use Tk::BrowseEntry;
-use File::Copy;
 use File::Basename;
 use File::Find;
 use File::Spec;
@@ -556,6 +555,35 @@ sub format_size {
     return sprintf("%.2f %s", $size, $units[$unit_idx]);
 }
 
+sub chunked_copy {
+    my ($src, $dest, $file_size, $progress_window, $file_label, $progress_canvas, $progress_rect, $progress_text, $base_pct, $file_pct_share) = @_;
+
+    open(my $in,  '<:raw', $src)  or die "Cannot open $src: $!";
+    open(my $out, '>:raw', $dest) or die "Cannot open $dest: $!";
+
+    my $chunk_size = 1024 * 1024;  # 1MB chunks
+    my $copied     = 0;
+    my $buf;
+
+    while (my $bytes = read($in, $buf, $chunk_size)) {
+        print $out $buf or die "Write failed: $!";
+        $copied += $bytes;
+
+        if ($progress_canvas && $file_size > 0) {
+            my $file_progress = $copied / $file_size;
+            my $pct       = int($base_pct + $file_progress * $file_pct_share);
+            my $bar_width = int($pct / 100 * 500);
+            $progress_canvas->coords($progress_rect, 0, 0, $bar_width, 30);
+            $progress_canvas->itemconfigure($progress_text, -text => "$pct%");
+        }
+
+        $progress_window->update;
+    }
+
+    close($in);
+    close($out);
+}
+
 sub copy_directory_recursive {
     my ($source_dir, $dest_dir, $progress_window, $file_label, $progress_canvas, $progress_rect, $progress_text) = @_;
 
@@ -570,8 +598,8 @@ sub copy_directory_recursive {
         push @all_items, { src => $name, is_dir => (-d $name) ? 1 : 0 };
     }, $source_dir);
 
-    my $total    = scalar @all_items;
-    my $done     = 0;
+    my $total      = scalar @all_items;
+    my $done       = 0;
     my $file_count = 0;
     my $dir_count  = 0;
 
@@ -581,16 +609,25 @@ sub copy_directory_recursive {
         my $relative     = File::Spec->abs2rel($source_file, $source_dir);
         my $dest_file    = File::Spec->catfile($dest_dir, $relative);
 
+        $file_label->configure(-text => "  $relative");
+        $progress_window->update;
+
         if ($item->{is_dir}) {
             make_path($dest_file) unless -d $dest_file;
             $dir_count++;
+            $done++;
         } else {
-            copy($source_file, $dest_file) or die "Failed to copy $source_file: $!";
-            $file_count++;
-        }
+            my $file_size    = -s $source_file || 0;
+            my $base_pct     = $total > 0 ? int(($done / $total) * 100) : 0;
+            my $file_pct_share = $total > 0 ? (1 / $total) * 100 : 100;
 
-        $done++;
-        $file_label->configure(-text => "  $relative");
+            chunked_copy($source_file, $dest_file, $file_size,
+                         $progress_window, $file_label,
+                         $progress_canvas, $progress_rect, $progress_text,
+                         $base_pct, $file_pct_share);
+            $file_count++;
+            $done++;
+        }
 
         if ($progress_canvas && $total > 0) {
             my $pct       = int(($done / $total) * 100);
@@ -767,7 +804,11 @@ sub copy_files {
 
         eval {
             if ($item->{type} eq 'file') {
-                copy($source, $dest) or die "Copy failed: $!";
+                my $file_size = -s $source || 0;
+                chunked_copy($source, $dest, $file_size,
+                             $progress_window, $file_label,
+                             $progress_canvas, $progress_rect, $progress_text,
+                             $percent, 100 - $percent);
             } elsif ($item->{type} eq 'dir') {
                 my ($files, $dirs) = copy_directory_recursive($source, $dest, $progress_window, $file_label, $progress_canvas, $progress_rect, $progress_text);
             }
