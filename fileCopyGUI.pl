@@ -4,8 +4,6 @@ use strict;
 use warnings;
 use Tk;
 use Tk::BrowseEntry;
-use Tk::HList;
-use Tk::ItemStyle;
 use File::Copy;
 use File::Basename;
 use File::Find;
@@ -76,7 +74,7 @@ my $top_frame = $mw->Frame(-relief => 'raised', -borderwidth => 2)
 
 $top_frame->Label(-text => 'Remote Share:')->pack(-side => 'left', -padx => 5);
 
-my $share_combo = $top_frame->BrowseEntry(
+$top_frame->BrowseEntry(
     -variable => \$selected_share,
     -state => 'readonly',
     -width => 20,
@@ -110,7 +108,7 @@ $left_pane->Label(
 # Local path frame
 my $local_path_frame = $left_pane->Frame()->pack(-side => 'top', -fill => 'x', -padx => 5, -pady => 5);
 $local_path_frame->Label(-text => 'Path:')->pack(-side => 'left');
-my $local_path_entry = $local_path_frame->Entry(
+$local_path_frame->Entry(
     -textvariable => \$local_path,
     -width => 40
 )->pack(-side => 'left', -fill => 'x', -expand => 1, -padx => 5);
@@ -129,7 +127,7 @@ $local_path_frame->Button(
 my $local_sort_frame = $left_pane->Frame()->pack(-side => 'top', -fill => 'x', -padx => 5, -pady => 2);
 $local_sort_frame->Label(-text => 'Sort by:')->pack(-side => 'left');
 
-my $sort_combo = $local_sort_frame->BrowseEntry(
+$local_sort_frame->BrowseEntry(
     -variable => \$local_sort,
     -state => 'readonly',
     -width => 15,
@@ -178,7 +176,7 @@ $middle_pane->packPropagate(0);
 $middle_pane->Frame(-height => 200)->pack(-side => 'top');
 
 # Copy to remote button
-my $copy_right_btn = $middle_pane->Button(
+$middle_pane->Button(
     -text => ">>>\nCopy to\nRemote",
     -width => 12,
     -height => 4,
@@ -187,7 +185,7 @@ my $copy_right_btn = $middle_pane->Button(
 )->pack(-side => 'top', -pady => 10);
 
 # Copy to local button
-my $copy_left_btn = $middle_pane->Button(
+$middle_pane->Button(
     -text => "<<<\nCopy to\nLocal",
     -width => 12,
     -height => 4,
@@ -223,7 +221,7 @@ $right_pane->Label(
 # Remote path frame
 my $remote_path_frame = $right_pane->Frame()->pack(-side => 'top', -fill => 'x', -padx => 5, -pady => 5);
 $remote_path_frame->Label(-text => 'Path:')->pack(-side => 'left');
-my $remote_path_label = $remote_path_frame->Label(
+$remote_path_frame->Label(
     -textvariable => \$remote_path,
     -relief => 'sunken',
     -anchor => 'w',
@@ -514,26 +512,35 @@ sub get_selection_info {
     my ($listbox, $path) = @_;
     my @selection = $listbox->curselection();
 
-    my $count = 0;
+    my $file_count = 0;
+    my $dir_count  = 0;
     my $total_size = 0;
 
     foreach my $idx (@selection) {
         my $item = $listbox->get($idx);
-        next if $item =~ /^\[.*\]$/;
+        next if $item eq '[..]';
 
-        my $filepath = File::Spec->catfile($path, $item);
-        if (-f $filepath) {
-            $count++;
-            $total_size += -s $filepath;
+        if ($item =~ /^\[(.*)\]$/) {
+            $dir_count++;
+        } else {
+            my $filepath = File::Spec->catfile($path, $item);
+            if (-f $filepath) {
+                $file_count++;
+                $total_size += -s $filepath;
+            }
         }
     }
 
-    if ($count == 0) {
+    if ($file_count == 0 && $dir_count == 0) {
         return 'No files selected';
-    } else {
-        my $size_str = format_size($total_size);
-        return "$count file(s) selected - Total size: $size_str";
     }
+
+    my @parts;
+    push @parts, "$file_count file(s)" if $file_count > 0;
+    push @parts, "$dir_count folder(s)" if $dir_count > 0;
+    my $desc = join(' and ', @parts);
+    my $size_str = format_size($total_size);
+    return "$desc selected" . ($file_count > 0 ? " - Total size: $size_str" : '');
 }
 
 sub format_size {
@@ -553,7 +560,7 @@ sub copy_directory_recursive {
     my ($source_dir, $dest_dir, $progress_window, $file_label, $progress_canvas, $progress_rect, $progress_text) = @_;
 
     # Create destination directory
-    make_path($dest_dir) or die "Failed to create directory $dest_dir: $!" unless -d $dest_dir;
+    make_path($dest_dir) unless -d $dest_dir;
 
     # First pass: collect all items so we know the total for progress %
     my @all_items;
