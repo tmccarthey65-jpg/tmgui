@@ -425,7 +425,7 @@ sub populate_local_listbox {
 }
 
 sub populate_listbox {
-    my ($listbox, $path, $sort_by) = @_;
+    my ($listbox, $path) = @_;
 
     opendir(my $dh, $path) or do {
         $status_label->configure(-text => "Error: Cannot read directory!");
