@@ -5,6 +5,7 @@ use warnings;
 use autodie;
 use LWP::UserAgent;
 use JSON;
+use URI::Escape;
 
 # Configuration for all shares
 my %shares = (
@@ -94,7 +95,11 @@ sub unmount_share {
     }
 
     system('sudo', 'umount', $cfg->{mount});
-    print "Unmounted: $name\n" unless is_mounted($cfg->{mount});
+    if (is_mounted($cfg->{mount})) {
+        warn "Failed to unmount: $name\n";
+    } else {
+        print "Unmounted: $name\n";
+    }
 }
 
 sub tmdb_search {
@@ -107,7 +112,7 @@ sub tmdb_search {
         chomp($api_key = <$fh>);
         close($fh);
     }
-    $movie_title =~ s/ /%20/g;
+    $movie_title = uri_escape($movie_title);
 
     my $ua = LWP::UserAgent->new;
 
@@ -194,5 +199,6 @@ elsif ($command eq 'tmdb') {
     tmdb_search($title);
 }
 else {
-    die "Unknown command: $command\n\n";
+    print "Unknown command: $command\n\n";
+    show_usage();
 }
