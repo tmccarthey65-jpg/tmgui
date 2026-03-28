@@ -1,0 +1,4 @@
+plex_config.py
+*.bak
+*.gemini
+shares.json
