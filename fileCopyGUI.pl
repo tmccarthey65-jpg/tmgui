@@ -9,6 +9,9 @@ use File::Find;
 use File::Spec;
 use File::Path qw(make_path);
 use Encode qw(encode_utf8);
+use JSON;
+use File::Slurp;
+use IPC::System::Simple qw(capture);
 
 # Single-instance enforcement via PID lock file
 my $LOCK_FILE = '/tmp/fileCopyGUI.lock';
@@ -101,47 +104,17 @@ my $F_MONO    = ['Courier', 10];            # monospaced (used for paths)
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-my %shares = (
-    'dennis-movies' => {
-        share => '//REDACTED/PlexMediaServer/Movies/DVD',
-        mount => '/home/timmccarthey/Public/DennisMovies',
-        creds => '/home/timmccarthey/.cifs-dennis',
-    },
-    'dennis-shows' => {
-        share => '//REDACTED/PlexMediaServer/TVShows/RecordedTV/',
-        mount => '/home/timmccarthey/Public/DennisShows',
-        creds => '/home/timmccarthey/.cifs-dennis',
-    },
-    'mike-movies' => {
-        share => '//REDACTED/Movies/DVD',
-        mount => '/home/timmccarthey/Public/MikeMovies',
-        creds => '/home/timmccarthey/.cifs-mike',
-    },
-    'mike-shows' => {
-        share => '//REDACTED/TVshows/RecordedTV',
-        mount => '/home/timmccarthey/Public/MikeShows',
-        creds => '/home/timmccarthey/.cifs-mike',
-    },
-    'mom-movies' => {
-        share => '//REDACTED/Movies/DVD',
-        mount => '/home/timmccarthey/Public/MomMovies',
-        creds => '/home/timmccarthey/.cifs-mom',
-    },
-    'mom-shows' => {
-        share => '//REDACTED/TVShows/RecordedTV',
-        mount => '/home/timmccarthey/Public/MomShows',
-        creds => '/home/timmccarthey/.cifs-mom',
-    },
-    'tim-movies' => {
-        share => '//REDACTED/docker/Plex/Movies/DVD',
-        mount => '/home/timmccarthey/Public/TimMovies',
-        creds => '/home/timmccarthey/.cifs-tim',
-    },
-    'tim-shows' => {
-        share => '//REDACTED/docker/Plex/Shows/RecordedTV',
-        mount => '/home/timmccarthey/Public/TimShows',
-        creds => '/home/timmccarthey/.cifs-tim',
-    },
+my $json_text  = read_file('/home/timmccarthey/Public/shares.json');
+my $shares_ref = decode_json($json_text);
+my %shares     = %{$shares_ref};
+
+my $mount_opts_template = join(',',
+    'credentials=CREDS',
+    'iocharset=utf8',
+    'file_mode=0777',
+    'dir_mode=0777',
+    'soft',
+    'noperm',
 );
 
 # ---------------------------------------------------------------------------
@@ -596,20 +569,66 @@ sub browse_remote {
     }
 }
 
+sub mount_share {
+    my ($name) = @_;
+    my $cfg = $shares{$name} or return;
+    return if is_mounted($cfg->{mount});
+
+    $status_label->configure(-text => "Mounting $name...", -fg => $C_STATUS_OK);
+    $mw->update;
+
+    my $opts = $mount_opts_template;
+    $opts =~ s/CREDS/$cfg->{creds}/;
+
+    eval { capture('sudo', 'mount', '-t', 'cifs', $cfg->{share}, $cfg->{mount}, '-o', $opts) };
+
+    if (is_mounted($cfg->{mount})) {
+        $status_label->configure(-text => "Mounted: $name", -fg => $C_STATUS_OK);
+    } else {
+        $status_label->configure(-text => "Mount failed: $name", -fg => '#C05050');
+        $mw->messageBox(
+            -title   => 'Mount Failed',
+            -message => "Could not mount '$name'.\nCheck that the remote machine is online and your credentials are correct.",
+            -type    => 'OK',
+            -icon    => 'error',
+        );
+    }
+}
+
+sub unmount_share {
+    my ($name) = @_;
+    my $cfg = $shares{$name} or return;
+    return unless is_mounted($cfg->{mount});
+
+    $status_label->configure(-text => "Unmounting $name...", -fg => $C_STATUS_OK);
+    $mw->update;
+
+    my $max_retries = 3;
+    for my $attempt (1 .. $max_retries) {
+        eval { capture('sudo', 'umount', $cfg->{mount}) };
+        last unless is_mounted($cfg->{mount});
+        sleep 2 if $attempt < $max_retries;
+    }
+
+    if (is_mounted($cfg->{mount})) {
+        eval { capture('sudo', 'umount', '-l', $cfg->{mount}) };
+    }
+
+    if (!is_mounted($cfg->{mount})) {
+        $status_label->configure(-text => "Unmounted: $name", -fg => $C_STATUS_OK);
+    } else {
+        $status_label->configure(-text => "Unmount failed: $name", -fg => '#C05050');
+    }
+}
+
 sub load_remote_share {
     return unless $selected_share;
 
     my $mount_point = $shares{$selected_share}{mount};
 
     unless (is_mounted($mount_point)) {
-        $status_label->configure(-text => "Warning: $selected_share is not mounted!", -fg => '#C05050');
-        $mw->messageBox(
-            -title   => 'Not Mounted',
-            -message => "The share '$selected_share' is not currently mounted.\nPlease mount it using catchAll.pl first:\n\n./catchAll.pl mt $selected_share",
-            -type    => 'OK',
-            -icon    => 'warning',
-        );
-        return;
+        mount_share($selected_share);
+        return unless is_mounted($mount_point);
     }
 
     $remote_path       = $mount_point;
@@ -1040,6 +1059,8 @@ sub copy_files {
     );
 
     if ($src_name eq 'local') { refresh_remote_list() } else { refresh_local_list() }
+
+    unmount_share($selected_share) if $selected_share;
 }
 
 # Defer BrowseEntry foreground fixes until after the event loop initializes all widgets.
@@ -1047,6 +1068,20 @@ $mw->after(1, sub {
     browse_entry_fg($share_entry,      $C_SHARE_FG);
     browse_entry_fg($local_sort_entry, $C_SORT_FG);
     browse_entry_fg($remote_sort_entry,$C_SORT_FG);
+});
+
+# Auto-mount local shares on startup
+$mw->after(1, sub {
+    mount_share('tim-movies');
+    mount_share('tim-shows');
+    refresh_local_list();
+});
+
+$mw->protocol('WM_DELETE_WINDOW', sub {
+    unmount_share($selected_share) if $selected_share && is_mounted($shares{$selected_share}{mount});
+    unmount_share('tim-movies');
+    unmount_share('tim-shows');
+    $mw->destroy;
 });
 
 MainLoop;
