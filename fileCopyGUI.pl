@@ -8,6 +8,7 @@ use File::Basename;
 use File::Find;
 use File::Spec;
 use File::Path qw(make_path);
+use Encode qw(encode_utf8);
 
 # Single-instance enforcement via PID lock file
 my $LOCK_FILE = '/tmp/fileCopyGUI.lock';
@@ -634,14 +635,21 @@ sub refresh_remote_list {
     return unless $remote_path;
 
     $remote_listbox->delete(0, 'end');
+    $status_label->configure(-text => "Loading remote directory...", -fg => $C_STATUS_OK);
+    $mw->update;
 
+    warn "DEBUG refresh_remote_list: checking -d $remote_path\n";
+    my $t0 = time();
     unless (-d $remote_path) {
         $status_label->configure(-text => "Error: Remote directory does not exist!", -fg => '#C05050');
+        warn "DEBUG refresh_remote_list: -d check failed after " . (time()-$t0) . "s\n";
         return;
     }
+    warn "DEBUG refresh_remote_list: -d check passed in " . (time()-$t0) . "s\n";
 
     my $dirs_only = ($remote_start_path && $remote_path eq $remote_start_path) ? 1 : 0;
     populate_local_listbox($remote_listbox, $remote_path, $remote_sort, $dirs_only);
+    warn "DEBUG refresh_remote_list: done in " . (time()-$t0) . "s total\n";
     $status_label->configure(-text => "Remote sorted by: $remote_sort", -fg => $C_STATUS_OK);
     update_remote_info();
 }
@@ -650,55 +658,57 @@ sub populate_local_listbox {
     my ($listbox, $path, $sort_by, $dirs_only) = @_;
     $sort_by ||= 'Name';
 
+    warn "DEBUG populate_local_listbox: opendir $path\n";
+    my $t0 = time();
     opendir(my $dh, $path) or do {
         $status_label->configure(-text => "Error: Cannot read directory!", -fg => '#C05050');
+        warn "DEBUG populate_local_listbox: opendir failed after " . (time()-$t0) . "s\n";
         return;
     };
 
     my @entries = readdir($dh);
     closedir($dh);
+    warn "DEBUG populate_local_listbox: readdir got " . scalar(@entries) . " entries in " . (time()-$t0) . "s\n";
 
     $listbox->insert('end', '[..]');
 
-    my @dirs  = grep { -d File::Spec->catfile($path, $_) && $_ ne '.' && $_ ne '..' } @entries;
-    my @files = $dirs_only ? () : grep { -f File::Spec->catfile($path, $_) } @entries;
+    # Stat each entry once and cache results
+    my %stat_cache;
+    for my $entry (@entries) {
+        next if $entry eq '.' || $entry eq '..';
+        my $full = File::Spec->catfile($path, $entry);
+        my @st = stat($full);
+        $stat_cache{$entry} = { full => $full, mtime => $st[9], size => $st[7], is_dir => -d _ };
+    }
+
+    my @dirs  = grep { $stat_cache{$_} && $stat_cache{$_}{is_dir} } keys %stat_cache;
+    my @files = $dirs_only ? () : grep { $stat_cache{$_} && !$stat_cache{$_}{is_dir} } keys %stat_cache;
     my @all   = (@dirs, @files);
+    warn "DEBUG populate_local_listbox: stat pass done (" . scalar(@dirs) . " dirs, " . scalar(@files) . " files) in " . (time()-$t0) . "s\n";
     my @sorted;
 
     if ($sort_by eq 'Date (Newest)') {
-        @sorted = sort {
-            (stat(File::Spec->catfile($path, $b)))[9] <=>
-            (stat(File::Spec->catfile($path, $a)))[9]
-        } @all;
+        @sorted = sort { $stat_cache{$b}{mtime} <=> $stat_cache{$a}{mtime} } @all;
     }
     elsif ($sort_by eq 'Date (Oldest)') {
-        @sorted = sort {
-            (stat(File::Spec->catfile($path, $a)))[9] <=>
-            (stat(File::Spec->catfile($path, $b)))[9]
-        } @all;
+        @sorted = sort { $stat_cache{$a}{mtime} <=> $stat_cache{$b}{mtime} } @all;
     }
     elsif ($sort_by eq 'Size (Largest)') {
-        @sorted = sort {
-            (stat(File::Spec->catfile($path, $b)))[7] <=>
-            (stat(File::Spec->catfile($path, $a)))[7]
-        } @all;
+        @sorted = sort { $stat_cache{$b}{size} <=> $stat_cache{$a}{size} } @all;
     }
     elsif ($sort_by eq 'Size (Smallest)') {
-        @sorted = sort {
-            (stat(File::Spec->catfile($path, $a)))[7] <=>
-            (stat(File::Spec->catfile($path, $b)))[7]
-        } @all;
+        @sorted = sort { $stat_cache{$a}{size} <=> $stat_cache{$b}{size} } @all;
     }
     else {
         @sorted = sort @all;
     }
+    warn "DEBUG populate_local_listbox: sort done in " . (time()-$t0) . "s\n";
 
     foreach my $item (@sorted) {
-        my $fullpath = File::Spec->catfile($path, $item);
-        if (-d $fullpath) {
+        if ($stat_cache{$item}{is_dir}) {
             $listbox->insert('end', "[$item]\t  <DIR>");
         } else {
-            my $size = format_size(-s $fullpath || 0);
+            my $size = format_size($stat_cache{$item}{size} || 0);
             $listbox->insert('end', "$item\t  $size");
         }
     }
@@ -807,8 +817,8 @@ sub chunked_copy {
 
     warn "DEBUG chunked_copy: $src -> $dest\n";
 
-    open(my $in,  '<:raw', $src)  or die "Cannot open $src: $!";
-    open(my $out, '>:raw', $dest) or die "Cannot open $dest: $!";
+    open(my $in,  '<:raw', encode_utf8($src))  or die "Cannot open $src: $!";
+    open(my $out, '>:raw', encode_utf8($dest)) or die "Cannot open $dest: $!";
 
     my ($buf, $total_bytes) = ('', 0);
     while (my $bytes = read($in, $buf, 1024 * 1024)) {
