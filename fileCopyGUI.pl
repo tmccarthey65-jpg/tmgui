@@ -9,7 +9,97 @@ use File::Find;
 use File::Spec;
 use File::Path qw(make_path);
 
-# Configuration from catchAll.pl
+# Single-instance enforcement via PID lock file
+my $LOCK_FILE = '/tmp/fileCopyGUI.lock';
+
+if (-e $LOCK_FILE) {
+    open(my $lf, '<', $LOCK_FILE) or die "Cannot read lock file: $!";
+    my $pid = <$lf>;
+    close($lf);
+    chomp $pid if defined $pid;
+
+    if (defined $pid && $pid =~ /^\d+$/ && kill(0, $pid)) {
+        # Another instance is running — show a Tk error dialog then exit
+        my $tmp = MainWindow->new;
+        $tmp->withdraw;
+        $tmp->messageBox(
+            -title   => 'Already Running',
+            -message => "fileCopyGUI is already running (PID $pid).\nOnly one instance is allowed.",
+            -type    => 'OK',
+            -icon    => 'error',
+        );
+        $tmp->destroy;
+        exit 1;
+    }
+    # Stale lock file — remove it
+    unlink $LOCK_FILE;
+}
+
+# Write our PID to the lock file
+open(my $lf, '>', $LOCK_FILE) or die "Cannot create lock file: $!";
+print $lf $$;
+close($lf);
+
+END { unlink $LOCK_FILE if -e $LOCK_FILE }
+
+# ---------------------------------------------------------------------------
+# Color & font theme
+# ---------------------------------------------------------------------------
+# All colors are HTML hex strings (#RRGGBB).
+# Edit these variables to retheme the entire UI — each variable is used
+# consistently throughout the script, so changing it here changes it everywhere.
+#
+# BACKGROUNDS
+my $C_BG         = '#1E1E2E';   # outermost window / frame background (darkest layer)
+my $C_PANEL      = '#2A2A3E';   # pane background (sits on top of $C_BG)
+my $C_CARD       = '#313145';   # listbox / inner card (dark variant — commented out)
+my $C_BORDER     = '#44445A';   # subtle separator lines between UI sections
+
+# PANE HEADER BARS  (the colored title bars above each file list)
+my $C_HDR_LOCAL  = '#1A6BB5';   # local pane header — blue
+my $C_HDR_REMOTE = '#A0303A';   # remote pane header — red/maroon (distinguishes remote from local)
+my $C_HDR_FG     = '#FFFFFF';   # text color on both header bars
+
+# NEUTRAL BUTTONS  (Sort, Refresh, Select All, etc.)
+my $C_BTN_BG     = '#3A3A52';   # resting button background
+my $C_BTN_FG     = '#E0E0F0';   # button label text
+my $C_BTN_ACT    = '#4A4A6A';   # button background when pressed / hovered
+
+# ACTION BUTTONS  (the big copy arrows)
+my $C_BTN_GREEN     = '#1F6B3A';   # "copy to remote" button — green
+my $C_BTN_GREEN_ACT = '#2A8A4A';   # "copy to remote" hover/active state
+my $C_BTN_RED       = '#8B2020';   # "copy to local" button — red
+my $C_BTN_RED_ACT   = '#A83030';   # "copy to local" hover/active state
+
+# TEXT
+my $C_TEXT       = '#E0E0F0';   # primary body text (filenames, labels)
+my $C_SUBTEXT    = '#9090B0';   # secondary / dimmed text (file counts, hints)
+my $C_SEL_BG     = '#1A6BB5';   # listbox selection highlight background (matches local header)
+my $C_SEL_FG     = '#FFFFFF';   # listbox selection highlight text
+
+# REMOTE SHARE SELECTOR  (the dropdown in the toolbar for picking dennis-movies, etc.)
+#my $C_SHARE_FG   = '#E0E0F0';   # selected share text color — darken this value to make it easier to read
+my $C_SHARE_FG   = '#11141c';   # selected share text color — darken this value to make it easier to read
+
+# SORT DROPDOWNS  (the Sort: dropdowns in the local and remote panes)
+my $C_SORT_FG    = '#11141c';   # sort selection text color — darken to taste
+
+# STATUS BAR  (the strip along the bottom)
+my $C_STATUS_BG  = '#141422';   # status bar background (slightly darker than $C_BG)
+my $C_STATUS_FG  = '#8888AA';   # idle / informational status text
+my $C_STATUS_OK  = '#5BA05B';   # success message text (green)
+
+# FONTS  — [family, size] or [family, size, 'bold']
+# Change 'Helvetica' to any font installed on your system (e.g. 'Arial', 'DejaVu Sans').
+my $F_NORMAL  = ['Helvetica', 10];          # default label / listbox text
+my $F_BOLD    = ['Helvetica', 10, 'bold'];  # emphasized labels
+my $F_HEADER  = ['Helvetica', 12, 'bold'];  # pane header titles
+my $F_SMALL   = ['Helvetica', 9];           # small hints / file counts
+my $F_MONO    = ['Courier', 10];            # monospaced (used for paths)
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 my %shares = (
     'dennis-movies' => {
         share => '//REDACTED/PlexMediaServer/Movies/DVD',
@@ -53,211 +143,414 @@ my %shares = (
     },
 );
 
-# Create main window
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
 my $mw = MainWindow->new;
-$mw->title("Remote File Copy GUI - Dual Pane");
-$mw->geometry("1200x800");
+$mw->title("File Copy");
+$mw->geometry("1280x820");
+$mw->configure(-bg => $C_BG);
+$mw->optionAdd('*background',       $C_BG);
+$mw->optionAdd('*foreground',       $C_TEXT);
+$mw->optionAdd('*font',             $F_NORMAL);
+$mw->optionAdd('*Entry.background', $C_CARD);
+$mw->optionAdd('*Entry.foreground', $C_TEXT);
+$mw->optionAdd('*Entry.insertBackground', $C_TEXT);
+# BrowseEntry uses LabEntry internally; override its Entry foreground at the
+# highest priority ('interactive') so it beats the *Entry.foreground rule above.
+$mw->optionAdd('*LabEntry*Entry.foreground', $C_SORT_FG, 'interactive');
 
+# BrowseEntry nests its Entry inside a LabEntry (BrowseEntry->LabEntry->Entry),
+# so Subwidget('entry') doesn't reach it. This helper traverses to the real Entry.
+sub browse_entry_fg {
+    my ($be, $fg) = @_;
+    my ($le) = grep { ref($_) eq 'Tk::LabEntry' } $be->children;
+    return unless $le;
+    my ($e) = $le->children;
+    # BrowseEntry sets -state=>'readonly' by internally disabling the Entry,
+    # so Tk renders text using -disabledforeground, not -foreground.
+    $e->configure(-disabledforeground => $fg) if $e;
+}
+
+# ---------------------------------------------------------------------------
 # Variables
-my $selected_share = '';
-my $local_path = '/home/timmccarthey/Public';
-my $remote_path = '';
-my $local_sort = 'Date (Newest)';
+# ---------------------------------------------------------------------------
+my $selected_share    = '';
+my $local_path        = '/home/timmccarthey/Public';
+my $local_start_path  = '/home/timmccarthey/Public';
+my $remote_path       = '';
+my $remote_start_path = '';
+my $local_sort        = 'Date (Newest)';
+my $remote_sort       = 'Date (Newest)';
 
-# Declare widgets that will be created later
 my ($local_listbox, $remote_listbox, $local_info, $remote_info, $status_label);
 
-# Top frame
-my $top_frame = $mw->Frame(-relief => 'raised', -borderwidth => 2)
-    ->pack(-side => 'top', -fill => 'x', -padx => 5, -pady => 5);
+# ---------------------------------------------------------------------------
+# Helper: styled button
+# ---------------------------------------------------------------------------
+sub make_button {
+    my ($parent, %opts) = @_;
+    my $bg  = delete $opts{-bg}  // $C_BTN_BG;
+    my $fg  = delete $opts{-fg}  // $C_BTN_FG;
+    my $abg = delete $opts{-activebackground} // $C_BTN_ACT;
+    return $parent->Button(
+        -bg               => $bg,
+        -fg               => $fg,
+        -activebackground => $abg,
+        -activeforeground => $C_HDR_FG,
+        -relief           => 'flat',
+        -borderwidth      => 0,
+        -padx             => 12,
+        -pady             => 6,
+        -cursor           => 'hand2',
+        -font             => $F_BOLD,
+        %opts,
+    );
+}
 
-$top_frame->Label(-text => 'Remote Share:')->pack(-side => 'left', -padx => 5);
+# ---------------------------------------------------------------------------
+# Toolbar
+# ---------------------------------------------------------------------------
+my $toolbar = $mw->Frame(
+    -bg          => $C_PANEL,
+    -relief      => 'flat',
+    -borderwidth => 0,
+)->pack(-side => 'top', -fill => 'x', -padx => 0, -pady => 0);
 
-$top_frame->BrowseEntry(
+# thin accent line under toolbar
+$mw->Frame(-bg => $C_HDR_LOCAL, -height => 2)
+   ->pack(-side => 'top', -fill => 'x');
+
+$toolbar->Label(
+    -text   => 'Remote Share:',
+    -bg     => $C_PANEL,
+    -fg     => $C_SUBTEXT,
+    -font   => $F_SMALL,
+)->pack(-side => 'left', -padx => 16, -pady => 10);
+
+my $share_entry = $toolbar->BrowseEntry(
     -variable => \$selected_share,
-    -state => 'readonly',
-    -width => 20,
-    -choices => [sort keys %shares],
-    -browsecmd => \&load_remote_share
-)->pack(-side => 'left', -padx => 5);
+    -state    => 'readonly',
+    -width    => 22,
+    -choices  => [sort keys %shares],
+    -browsecmd => \&load_remote_share,
+    -bg       => $C_CARD,
+    -fg       => $C_SHARE_FG,
+    -font     => $F_NORMAL,
+)->pack(-side => 'left', -padx => 4, -pady => 10);
+# The global *Entry.foreground optionAdd overrides -fg on BrowseEntry, so we
+# must set the color directly on the internal Entry subwidget after creation.
+browse_entry_fg($share_entry, $C_SHARE_FG);
 
-$top_frame->Button(
-    -text => 'Check Mounts',
-    -command => \&check_mount_status
-)->pack(-side => 'left', -padx => 5);
+make_button($toolbar,
+    -text    => 'Check Mounts',
+    -command => \&check_mount_status,
+)->pack(-side => 'left', -padx => 6, -pady => 10);
 
-$top_frame->Button(
-    -text => 'Refresh Both',
-    -command => sub { refresh_local_list(); refresh_remote_list(); }
-)->pack(-side => 'left', -padx => 5);
+make_button($toolbar,
+    -text    => 'Refresh Both',
+    -command => sub { refresh_local_list(); refresh_remote_list(); },
+)->pack(-side => 'left', -padx => 2, -pady => 10);
 
-# Main dual-pane frame
-my $main_frame = $mw->Frame()->pack(-side => 'top', -fill => 'both', -expand => 1, -padx => 5, -pady => 5);
+# App title on the right
+$toolbar->Label(
+    -text   => 'File Copy',
+    -bg     => $C_PANEL,
+    -fg     => $C_HDR_LOCAL,
+    -font   => ['Helvetica', 13, 'bold'],
+)->pack(-side => 'right', -padx => 16, -pady => 10);
 
-# LEFT PANE - Local files
-my $left_pane = $main_frame->Frame(-relief => 'sunken', -borderwidth => 2)
-    ->pack(-side => 'left', -fill => 'both', -expand => 1);
+# ---------------------------------------------------------------------------
+# Dual-pane area
+# ---------------------------------------------------------------------------
+my $main_frame = $mw->Frame(-bg => $C_BG)
+    ->pack(-side => 'top', -fill => 'both', -expand => 1, -padx => 12, -pady => 10);
+
+# ---- LEFT PANE (Local) ----
+my $left_pane = $main_frame->Frame(-bg => $C_PANEL, -relief => 'flat', -borderwidth => 0)
+    ->pack(-side => 'left', -fill => 'both', -expand => 1, -padx => 6);
+
+$left_pane->Frame(-bg => $C_HDR_LOCAL, -height => 4)->pack(-side => 'top', -fill => 'x');
 
 $left_pane->Label(
-    -text => 'Local Files',
-    -bg => 'lightblue',
-    -font => ['Arial', 10, 'bold']
+    -text   => '  LOCAL FILES',
+    -bg     => $C_HDR_LOCAL,
+    -fg     => $C_HDR_FG,
+    -font   => $F_HEADER,
+    -anchor => 'w',
+    -pady   => 8,
 )->pack(-side => 'top', -fill => 'x');
 
-# Local path frame
-my $local_path_frame = $left_pane->Frame()->pack(-side => 'top', -fill => 'x', -padx => 5, -pady => 5);
-$local_path_frame->Label(-text => 'Path:')->pack(-side => 'left');
-$local_path_frame->Entry(
-    -textvariable => \$local_path,
-    -width => 40
-)->pack(-side => 'left', -fill => 'x', -expand => 1, -padx => 5);
+# Local path bar
+my $local_path_frame = $left_pane->Frame(-bg => $C_PANEL)
+    ->pack(-side => 'top', -fill => 'x', -padx => 10, -pady => 8);
 
-$local_path_frame->Button(
-    -text => 'Browse',
-    -command => \&browse_local
+$local_path_frame->Label(
+    -text => 'Path:',
+    -bg   => $C_PANEL,
+    -fg   => $C_SUBTEXT,
+    -font => $F_SMALL,
 )->pack(-side => 'left');
 
-$local_path_frame->Button(
-    -text => 'Go',
-    -command => \&refresh_local_list
+$local_path_frame->Entry(
+    -textvariable    => \$local_path,
+    -width           => 38,
+    -bg              => $C_CARD,
+    -fg              => $C_TEXT,
+    -insertbackground => $C_TEXT,
+    -relief          => 'flat',
+    -borderwidth     => 1,
+    -font            => $F_MONO,
+)->pack(-side => 'left', -fill => 'x', -expand => 1, -padx => 8);
+
+make_button($left_pane->Frame(-bg => $C_PANEL)->pack(-side => 'top', -fill => 'x', -padx => 10, -pady => 2),
+) if 0;  # placeholder — buttons packed inline below
+
+my $local_btn_bar = $local_path_frame;
+make_button($local_btn_bar,
+    -text    => 'Browse',
+    -command => \&browse_local,
 )->pack(-side => 'left', -padx => 2);
 
-# Sort options for local files
-my $local_sort_frame = $left_pane->Frame()->pack(-side => 'top', -fill => 'x', -padx => 5, -pady => 2);
-$local_sort_frame->Label(-text => 'Sort by:')->pack(-side => 'left');
-
-$local_sort_frame->BrowseEntry(
-    -variable => \$local_sort,
-    -state => 'readonly',
-    -width => 15,
-    -choices => ['Name', 'Date (Newest)', 'Date (Oldest)', 'Size (Largest)', 'Size (Smallest)'],
-    -listcmd => sub {
-        # This gets called when the dropdown is opened
-    },
-    -browsecmd => sub {
-        # This gets called when selection changes
-        refresh_local_list();
-    }
-)->pack(-side => 'left', -padx => 5);
-
-# Add a manual refresh button for sorting
-$local_sort_frame->Button(
-    -text => 'Apply',
-    -command => \&refresh_local_list
+make_button($local_btn_bar,
+    -text    => 'Go',
+    -command => \&refresh_local_list,
 )->pack(-side => 'left', -padx => 2);
 
-# Local file list
+# Local sort bar
+my $local_sort_frame = $left_pane->Frame(-bg => $C_PANEL)
+    ->pack(-side => 'top', -fill => 'x', -padx => 10, -pady => 2);
+
+$local_sort_frame->Label(
+    -text => 'Sort:',
+    -bg   => $C_PANEL,
+    -fg   => $C_SUBTEXT,
+    -font => $F_SMALL,
+)->pack(-side => 'left');
+
+my $local_sort_entry = $local_sort_frame->BrowseEntry(
+    -variable  => \$local_sort,
+    -state     => 'readonly',
+    -width     => 16,
+    -choices   => ['Name', 'Date (Newest)', 'Date (Oldest)', 'Size (Largest)', 'Size (Smallest)'],
+    -browsecmd => sub { refresh_local_list(); },
+    -bg        => $C_CARD,
+    -fg        => $C_SORT_FG,
+    -font      => $F_NORMAL,
+)->pack(-side => 'left', -padx => 8);
+browse_entry_fg($local_sort_entry, $C_SORT_FG);
+
+make_button($local_sort_frame,
+    -text    => 'Apply',
+    -command => \&refresh_local_list,
+)->pack(-side => 'left');
+
+# Local listbox
 $local_listbox = $left_pane->Scrolled('Listbox',
-    -scrollbars => 'osoe',
-    -selectmode => 'multiple',
-    -width => 50,
-    -height => 25
-)->pack(-fill => 'both', -expand => 1, -padx => 5, -pady => 5);
+    -scrollbars       => 'osoe',
+    -selectmode       => 'multiple',
+    -width            => 50,
+    -height           => 22,
+    -bg               => $C_CARD,
+    -fg               => $C_TEXT,
+    -selectbackground => $C_SEL_BG,
+    -selectforeground => $C_SEL_FG,
+    -relief           => 'flat',
+    -borderwidth      => 0,
+    -font             => $F_MONO,
+    -activestyle      => 'none',
+)->pack(-fill => 'both', -expand => 1, -padx => 10, -pady => 6);
 
 $local_listbox->bind('<Double-1>' => sub { navigate_local(); });
-
-# Local selection info
-$local_info = $left_pane->Label(
-    -text => 'No files selected',
-    -relief => 'sunken',
-    -anchor => 'w'
-)->pack(-side => 'bottom', -fill => 'x', -padx => 5, -pady => 5);
-
 $local_listbox->bind('<<ListboxSelect>>' => sub { update_local_info(); });
 
-# MIDDLE PANE - Transfer buttons
-my $middle_pane = $main_frame->Frame(-width => 100)
-    ->pack(-side => 'left', -fill => 'y', -padx => 10);
+# Local info bar
+$local_info = $left_pane->Label(
+    -text    => 'No files selected',
+    -bg      => $C_STATUS_BG,
+    -fg      => $C_STATUS_FG,
+    -font    => $F_SMALL,
+    -anchor  => 'w',
+    -pady    => 5,
+    -padx    => 10,
+)->pack(-side => 'bottom', -fill => 'x');
 
+# ---- MIDDLE PANE (Transfer buttons) ----
+my $middle_pane = $main_frame->Frame(-bg => $C_BG, -width => 110)
+    ->pack(-side => 'left', -fill => 'y', -padx => 4);
 $middle_pane->packPropagate(0);
 
-# Add some spacing
-$middle_pane->Frame(-height => 200)->pack(-side => 'top');
+$middle_pane->Frame(-bg => $C_BG, -height => 180)->pack(-side => 'top');
 
-# Copy to remote button
-$middle_pane->Button(
-    -text => ">>>\nCopy to\nRemote",
-    -width => 12,
-    -height => 4,
-    -bg => 'lightgreen',
-    -command => \&copy_to_remote
+make_button($middle_pane,
+    -text    => ">>>\nCopy to\nRemote",
+    -width   => 11,
+    -height  => 4,
+    -bg      => $C_BTN_GREEN,
+    -fg      => $C_HDR_FG,
+    -activebackground => $C_BTN_GREEN_ACT,
+    -command => \&copy_to_remote,
 )->pack(-side => 'top', -pady => 10);
 
-# Copy to local button
-$middle_pane->Button(
-    -text => "<<<\nCopy to\nLocal",
-    -width => 12,
-    -height => 4,
-    -bg => 'lightcoral',
-    -command => \&copy_to_local
+make_button($middle_pane,
+    -text    => "<<<\nCopy to\nLocal",
+    -width   => 11,
+    -height  => 4,
+    -bg      => $C_BTN_RED,
+    -fg      => $C_HDR_FG,
+    -activebackground => $C_BTN_RED_ACT,
+    -command => \&copy_to_local,
 )->pack(-side => 'top', -pady => 10);
 
-# Select all buttons
-$middle_pane->Frame(-height => 50)->pack(-side => 'top');
+$middle_pane->Frame(-bg => $C_BG, -height => 30)->pack(-side => 'top');
 
-$middle_pane->Button(
-    -text => "Select All\nLocal",
-    -width => 12,
-    -command => sub { $local_listbox->selectionSet(0, 'end'); update_local_info(); }
-)->pack(-side => 'top', -pady => 5);
+make_button($middle_pane,
+    -text    => "Select All\nLocal",
+    -width   => 11,
+    -command => sub { $local_listbox->selectionSet(0, 'end'); update_local_info(); },
+)->pack(-side => 'top', -pady => 4);
 
-$middle_pane->Button(
-    -text => "Select All\nRemote",
-    -width => 12,
-    -command => sub { $remote_listbox->selectionSet(0, 'end'); update_remote_info(); }
-)->pack(-side => 'top', -pady => 5);
+make_button($middle_pane,
+    -text    => "Select All\nRemote",
+    -width   => 11,
+    -command => sub { $remote_listbox->selectionSet(0, 'end'); update_remote_info(); },
+)->pack(-side => 'top', -pady => 4);
 
-# RIGHT PANE - Remote files
-my $right_pane = $main_frame->Frame(-relief => 'sunken', -borderwidth => 2)
-    ->pack(-side => 'left', -fill => 'both', -expand => 1);
+# ---- RIGHT PANE (Remote) ----
+my $right_pane = $main_frame->Frame(-bg => $C_PANEL, -relief => 'flat', -borderwidth => 0)
+    ->pack(-side => 'left', -fill => 'both', -expand => 1, -padx => 6);
+
+$right_pane->Frame(-bg => $C_HDR_REMOTE, -height => 4)->pack(-side => 'top', -fill => 'x');
 
 $right_pane->Label(
-    -text => 'Remote Files',
-    -bg => 'lightcoral',
-    -font => ['Arial', 10, 'bold']
+    -text   => '  REMOTE FILES',
+    -bg     => $C_HDR_REMOTE,
+    -fg     => $C_HDR_FG,
+    -font   => $F_HEADER,
+    -anchor => 'w',
+    -pady   => 8,
 )->pack(-side => 'top', -fill => 'x');
 
-# Remote path frame
-my $remote_path_frame = $right_pane->Frame()->pack(-side => 'top', -fill => 'x', -padx => 5, -pady => 5);
-$remote_path_frame->Label(-text => 'Path:')->pack(-side => 'left');
-$remote_path_frame->Label(
-    -textvariable => \$remote_path,
-    -relief => 'sunken',
-    -anchor => 'w',
-    -width => 40
-)->pack(-side => 'left', -fill => 'x', -expand => 1, -padx => 5);
+# Remote path bar
+my $remote_path_frame = $right_pane->Frame(-bg => $C_PANEL)
+    ->pack(-side => 'top', -fill => 'x', -padx => 10, -pady => 8);
 
-# Remote file list
+$remote_path_frame->Label(
+    -text => 'Path:',
+    -bg   => $C_PANEL,
+    -fg   => $C_SUBTEXT,
+    -font => $F_SMALL,
+)->pack(-side => 'left');
+
+$remote_path_frame->Entry(
+    -textvariable    => \$remote_path,
+    -width           => 38,
+    -bg              => $C_CARD,
+    -fg              => $C_TEXT,
+    -insertbackground => $C_TEXT,
+    -relief          => 'flat',
+    -borderwidth     => 1,
+    -font            => $F_MONO,
+)->pack(-side => 'left', -fill => 'x', -expand => 1, -padx => 8);
+
+make_button($remote_path_frame,
+    -text    => 'Browse',
+    -command => \&browse_remote,
+)->pack(-side => 'left', -padx => 2);
+
+make_button($remote_path_frame,
+    -text    => 'Go',
+    -command => \&refresh_remote_list,
+)->pack(-side => 'left', -padx => 2);
+
+# Remote sort bar
+my $remote_sort_frame = $right_pane->Frame(-bg => $C_PANEL)
+    ->pack(-side => 'top', -fill => 'x', -padx => 10, -pady => 2);
+
+$remote_sort_frame->Label(
+    -text => 'Sort:',
+    -bg   => $C_PANEL,
+    -fg   => $C_SUBTEXT,
+    -font => $F_SMALL,
+)->pack(-side => 'left');
+
+my $remote_sort_entry = $remote_sort_frame->BrowseEntry(
+    -variable  => \$remote_sort,
+    -state     => 'readonly',
+    -width     => 16,
+    -choices   => ['Name', 'Date (Newest)', 'Date (Oldest)', 'Size (Largest)', 'Size (Smallest)'],
+    -browsecmd => sub { refresh_remote_list(); },
+    -bg        => $C_CARD,
+    -fg        => $C_SORT_FG,
+    -font      => $F_NORMAL,
+)->pack(-side => 'left', -padx => 8);
+browse_entry_fg($remote_sort_entry, $C_SORT_FG);
+
+make_button($remote_sort_frame,
+    -text    => 'Apply',
+    -command => \&refresh_remote_list,
+)->pack(-side => 'left');
+
+# Remote listbox
 $remote_listbox = $right_pane->Scrolled('Listbox',
-    -scrollbars => 'osoe',
-    -selectmode => 'multiple',
-    -width => 50,
-    -height => 25
-)->pack(-fill => 'both', -expand => 1, -padx => 5, -pady => 5);
+    -scrollbars       => 'osoe',
+    -selectmode       => 'multiple',
+    -width            => 50,
+    -height           => 22,
+    -bg               => $C_CARD,
+    -fg               => $C_TEXT,
+    -selectbackground => $C_SEL_BG,
+    -selectforeground => $C_SEL_FG,
+    -relief           => 'flat',
+    -borderwidth      => 0,
+    -font             => $F_MONO,
+    -activestyle      => 'none',
+)->pack(-fill => 'both', -expand => 1, -padx => 10, -pady => 6);
 
 $remote_listbox->bind('<Double-1>' => sub { navigate_remote(); });
-
-# Remote selection info
-$remote_info = $right_pane->Label(
-    -text => 'No files selected',
-    -relief => 'sunken',
-    -anchor => 'w'
-)->pack(-side => 'bottom', -fill => 'x', -padx => 5, -pady => 5);
-
 $remote_listbox->bind('<<ListboxSelect>>' => sub { update_remote_info(); });
 
-# Status bar
-my $status_frame = $mw->Frame(-relief => 'sunken', -borderwidth => 2)
-    ->pack(-side => 'bottom', -fill => 'x');
-$status_label = $status_frame->Label(
-    -text => 'Ready',
-    -anchor => 'w'
-)->pack(-side => 'left', -fill => 'x', -expand => 1);
+# Remote info bar
+$remote_info = $right_pane->Label(
+    -text   => 'No files selected',
+    -bg     => $C_STATUS_BG,
+    -fg     => $C_STATUS_FG,
+    -font   => $F_SMALL,
+    -anchor => 'w',
+    -pady   => 5,
+    -padx   => 10,
+)->pack(-side => 'bottom', -fill => 'x');
 
-# Initialize local view
+# ---------------------------------------------------------------------------
+# Status bar
+# ---------------------------------------------------------------------------
+$mw->Frame(-bg => $C_BORDER, -height => 1)->pack(-side => 'bottom', -fill => 'x');
+my $status_bar = $mw->Frame(-bg => $C_STATUS_BG)
+    ->pack(-side => 'bottom', -fill => 'x');
+
+$status_bar->Label(
+    -text  => '  STATUS',
+    -bg    => $C_STATUS_BG,
+    -fg    => $C_HDR_LOCAL,
+    -font  => ['Helvetica', 8, 'bold'],
+)->pack(-side => 'left', -padx => 8, -pady => 5);
+
+$status_label = $status_bar->Label(
+    -text   => 'Ready',
+    -bg     => $C_STATUS_BG,
+    -fg     => $C_STATUS_OK,
+    -font   => $F_SMALL,
+    -anchor => 'w',
+)->pack(-side => 'left', -fill => 'x', -expand => 1, -pady => 5);
+
+# ---------------------------------------------------------------------------
+# Initialize
+# ---------------------------------------------------------------------------
 refresh_local_list();
 
+# ===========================================================================
 # Subroutines
+# ===========================================================================
 
 sub is_mounted {
     my ($mount_point) = @_;
@@ -272,20 +565,33 @@ sub check_mount_status {
         $msg .= sprintf "%-15s : %s\n", $name, $mounted;
     }
     $mw->messageBox(
-        -title => 'Mount Status',
+        -title   => 'Mount Status',
         -message => $msg,
-        -type => 'OK'
+        -type    => 'OK',
     );
 }
 
 sub browse_local {
     my $dir = $mw->chooseDirectory(
-        -title => 'Select Local Directory',
-        -initialdir => $local_path
+        -title      => 'Select Local Directory',
+        -initialdir => $local_path,
     );
     if (defined $dir) {
         $local_path = $dir;
         refresh_local_list();
+    }
+}
+
+sub browse_remote {
+    my $start = ($remote_path && -d $remote_path) ? $remote_path : '/home/timmccarthey/Public';
+    my $dir = $mw->chooseDirectory(
+        -title      => 'Select Remote Directory',
+        -initialdir => $start,
+    );
+    if (defined $dir) {
+        $remote_path       = $dir;
+        $remote_start_path = $dir;
+        refresh_remote_list();
     }
 }
 
@@ -295,166 +601,116 @@ sub load_remote_share {
     my $mount_point = $shares{$selected_share}{mount};
 
     unless (is_mounted($mount_point)) {
-        $status_label->configure(-text => "Warning: $selected_share is not mounted!");
+        $status_label->configure(-text => "Warning: $selected_share is not mounted!", -fg => '#C05050');
         $mw->messageBox(
-            -title => 'Not Mounted',
+            -title   => 'Not Mounted',
             -message => "The share '$selected_share' is not currently mounted.\nPlease mount it using catchAll.pl first:\n\n./catchAll.pl mt $selected_share",
-            -type => 'OK',
-            -icon => 'warning'
+            -type    => 'OK',
+            -icon    => 'warning',
         );
         return;
     }
 
-    $remote_path = $mount_point;
+    $remote_path       = $mount_point;
+    $remote_start_path = $mount_point;
     refresh_remote_list();
 }
 
 sub refresh_local_list {
-    # Clear the listbox
     $local_listbox->delete(0, 'end');
 
     unless (-d $local_path) {
-        $status_label->configure(-text => "Error: Local directory does not exist!");
+        $status_label->configure(-text => "Error: Local directory does not exist!", -fg => '#C05050');
         return;
     }
 
-    populate_local_listbox($local_listbox, $local_path, $local_sort);
-    $status_label->configure(-text => "Loaded and sorted by: $local_sort");
+    my $dirs_only = ($local_path eq $local_start_path) ? 1 : 0;
+    populate_local_listbox($local_listbox, $local_path, $local_sort, $dirs_only);
+    $status_label->configure(-text => "Local sorted by: $local_sort", -fg => $C_STATUS_OK);
     update_local_info();
 }
 
 sub refresh_remote_list {
-    return unless $selected_share && $remote_path;
+    return unless $remote_path;
 
     $remote_listbox->delete(0, 'end');
 
     unless (-d $remote_path) {
-        $status_label->configure(-text => "Error: Remote directory does not exist!");
+        $status_label->configure(-text => "Error: Remote directory does not exist!", -fg => '#C05050');
         return;
     }
 
-    populate_listbox($remote_listbox, $remote_path);
+    my $dirs_only = ($remote_start_path && $remote_path eq $remote_start_path) ? 1 : 0;
+    populate_local_listbox($remote_listbox, $remote_path, $remote_sort, $dirs_only);
+    $status_label->configure(-text => "Remote sorted by: $remote_sort", -fg => $C_STATUS_OK);
     update_remote_info();
 }
 
 sub populate_local_listbox {
-    my ($listbox, $path, $sort_by) = @_;
+    my ($listbox, $path, $sort_by, $dirs_only) = @_;
     $sort_by ||= 'Name';
 
     opendir(my $dh, $path) or do {
-        $status_label->configure(-text => "Error: Cannot read directory!");
+        $status_label->configure(-text => "Error: Cannot read directory!", -fg => '#C05050');
         return;
     };
 
     my @entries = readdir($dh);
     closedir($dh);
 
-    # Add parent directory option
     $listbox->insert('end', '[..]');
 
-    # Separate directories and files
-    my @dirs = grep { -d File::Spec->catfile($path, $_) && $_ ne '.' && $_ ne '..' } @entries;
-    my @files = grep { -f File::Spec->catfile($path, $_) } @entries;
-
-    # Combine dirs and files for unified sorting
-    my @all_items = (@dirs, @files);
-    my @sorted_items;
+    my @dirs  = grep { -d File::Spec->catfile($path, $_) && $_ ne '.' && $_ ne '..' } @entries;
+    my @files = $dirs_only ? () : grep { -f File::Spec->catfile($path, $_) } @entries;
+    my @all   = (@dirs, @files);
+    my @sorted;
 
     if ($sort_by eq 'Date (Newest)') {
-        @sorted_items = sort {
-            my $file_a = File::Spec->catfile($path, $a);
-            my $file_b = File::Spec->catfile($path, $b);
-            my @stat_a = stat($file_a);
-            my @stat_b = stat($file_b);
-            my $time_a = $stat_a[9] || 0;
-            my $time_b = $stat_b[9] || 0;
-            $time_b <=> $time_a;
-        } @all_items;
+        @sorted = sort {
+            (stat(File::Spec->catfile($path, $b)))[9] <=>
+            (stat(File::Spec->catfile($path, $a)))[9]
+        } @all;
     }
     elsif ($sort_by eq 'Date (Oldest)') {
-        @sorted_items = sort {
-            my $file_a = File::Spec->catfile($path, $a);
-            my $file_b = File::Spec->catfile($path, $b);
-            my @stat_a = stat($file_a);
-            my @stat_b = stat($file_b);
-            my $time_a = $stat_a[9] || 0;
-            my $time_b = $stat_b[9] || 0;
-            $time_a <=> $time_b;
-        } @all_items;
+        @sorted = sort {
+            (stat(File::Spec->catfile($path, $a)))[9] <=>
+            (stat(File::Spec->catfile($path, $b)))[9]
+        } @all;
     }
     elsif ($sort_by eq 'Size (Largest)') {
-        @sorted_items = sort {
-            my $file_a = File::Spec->catfile($path, $a);
-            my $file_b = File::Spec->catfile($path, $b);
-            my @stat_a = stat($file_a);
-            my @stat_b = stat($file_b);
-            my $size_a = $stat_a[7] || 0;
-            my $size_b = $stat_b[7] || 0;
-            $size_b <=> $size_a;
-        } @all_items;
+        @sorted = sort {
+            (stat(File::Spec->catfile($path, $b)))[7] <=>
+            (stat(File::Spec->catfile($path, $a)))[7]
+        } @all;
     }
     elsif ($sort_by eq 'Size (Smallest)') {
-        @sorted_items = sort {
-            my $file_a = File::Spec->catfile($path, $a);
-            my $file_b = File::Spec->catfile($path, $b);
-            my @stat_a = stat($file_a);
-            my @stat_b = stat($file_b);
-            my $size_a = $stat_a[7] || 0;
-            my $size_b = $stat_b[7] || 0;
-            $size_a <=> $size_b;
-        } @all_items;
+        @sorted = sort {
+            (stat(File::Spec->catfile($path, $a)))[7] <=>
+            (stat(File::Spec->catfile($path, $b)))[7]
+        } @all;
     }
-    else {  # Name
-        @sorted_items = sort @all_items;
+    else {
+        @sorted = sort @all;
     }
 
-    # Insert items with proper formatting (directories with brackets)
-    foreach my $item (@sorted_items) {
+    foreach my $item (@sorted) {
         my $fullpath = File::Spec->catfile($path, $item);
         if (-d $fullpath) {
-            $listbox->insert('end', "[$item]");
+            $listbox->insert('end', "[$item]\t  <DIR>");
         } else {
-            $listbox->insert('end', $item);
+            my $size = format_size(-s $fullpath || 0);
+            $listbox->insert('end', "$item\t  $size");
         }
     }
 
-    $listbox->see(0);  # Scroll to top
-}
-
-sub populate_listbox {
-    my ($listbox, $path) = @_;
-
-    opendir(my $dh, $path) or do {
-        $status_label->configure(-text => "Error: Cannot read directory!");
-        return;
-    };
-
-    my @entries = readdir($dh);
-    closedir($dh);
-
-    # Add parent directory option
-    $listbox->insert('end', '[..]');
-
-    # Sort: directories first, then files (alphabetically for remote)
-    my @dirs = grep { -d File::Spec->catfile($path, $_) && $_ ne '.' && $_ ne '..' } @entries;
-    my @files = grep { -f File::Spec->catfile($path, $_) } @entries;
-
-    foreach my $dir (sort @dirs) {
-        $listbox->insert('end', "[$dir]");
-    }
-
-    foreach my $file (sort @files) {
-        $listbox->insert('end', $file);
-    }
-
-    $status_label->configure(-text => "Loaded " . (@dirs + @files) . " items from $path");
+    $listbox->see(0);
 }
 
 sub navigate_local {
-    my @selection = $local_listbox->curselection();
-    return unless @selection;
+    my @sel = $local_listbox->curselection();
+    return unless @sel;
 
-    my $item = $local_listbox->get($selection[0]);
+    my $item = extract_name($local_listbox->get($sel[0]));
 
     if ($item eq '[..]') {
         my $parent = dirname($local_path);
@@ -463,9 +719,8 @@ sub navigate_local {
             refresh_local_list();
         }
     }
-    elsif ($item =~ /^\[(.*)\]$/) {
-        my $dir_name = $1;
-        my $new_path = File::Spec->catfile($local_path, $dir_name);
+    elsif ($item =~ /^\[([^\]]+)\]/) {
+        my $new_path = File::Spec->catfile($local_path, $1);
         if (-d $new_path) {
             $local_path = $new_path;
             refresh_local_list();
@@ -474,22 +729,21 @@ sub navigate_local {
 }
 
 sub navigate_remote {
-    my @selection = $remote_listbox->curselection();
-    return unless @selection;
+    my @sel = $remote_listbox->curselection();
+    return unless @sel;
 
-    my $item = $remote_listbox->get($selection[0]);
+    my $item = extract_name($remote_listbox->get($sel[0]));
 
     if ($item eq '[..]') {
-        my $parent = dirname($remote_path);
+        my $parent     = dirname($remote_path);
         my $mount_root = $shares{$selected_share}{mount};
         if ($parent && $parent ne $remote_path && length($parent) >= length($mount_root)) {
             $remote_path = $parent;
             refresh_remote_list();
         }
     }
-    elsif ($item =~ /^\[(.*)\]$/) {
-        my $dir_name = $1;
-        my $new_path = File::Spec->catfile($remote_path, $dir_name);
+    elsif ($item =~ /^\[([^\]]+)\]/) {
+        my $new_path = File::Spec->catfile($remote_path, $1);
         if (-d $new_path) {
             $remote_path = $new_path;
             refresh_remote_list();
@@ -498,352 +752,291 @@ sub navigate_remote {
 }
 
 sub update_local_info {
-    my $info = get_selection_info($local_listbox, $local_path);
-    $local_info->configure(-text => $info);
+    $local_info->configure(-text => get_selection_info($local_listbox, $local_path));
 }
 
 sub update_remote_info {
-    my $info = get_selection_info($remote_listbox, $remote_path);
-    $remote_info->configure(-text => $info);
+    $remote_info->configure(-text => get_selection_info($remote_listbox, $remote_path));
 }
 
 sub get_selection_info {
     my ($listbox, $path) = @_;
-    my @selection = $listbox->curselection();
+    my @sel = $listbox->curselection();
+    my ($file_count, $dir_count, $total_size) = (0, 0, 0);
 
-    my $file_count = 0;
-    my $dir_count  = 0;
-    my $total_size = 0;
-
-    foreach my $idx (@selection) {
-        my $item = $listbox->get($idx);
+    foreach my $idx (@sel) {
+        my $item = extract_name($listbox->get($idx));
         next if $item eq '[..]';
-
-        if ($item =~ /^\[(.*)\]$/) {
+        if ($item =~ /^\[/) {
             $dir_count++;
         } else {
-            my $filepath = File::Spec->catfile($path, $item);
-            if (-f $filepath) {
+            my $fp = File::Spec->catfile($path, $item);
+            if (-f $fp) {
                 $file_count++;
-                $total_size += -s $filepath;
+                $total_size += -s $fp;
             }
         }
     }
 
-    if ($file_count == 0 && $dir_count == 0) {
-        return 'No files selected';
-    }
+    return 'No files selected' unless $file_count || $dir_count;
 
     my @parts;
-    push @parts, "$file_count file(s)" if $file_count > 0;
-    push @parts, "$dir_count folder(s)" if $dir_count > 0;
-    my $desc = join(' and ', @parts);
-    my $size_str = format_size($total_size);
-    return "$desc selected" . ($file_count > 0 ? " - Total size: $size_str" : '');
+    push @parts, "$file_count file(s)"   if $file_count;
+    push @parts, "$dir_count folder(s)"  if $dir_count;
+    my $desc = join(' and ', @parts) . ' selected';
+    $desc .= '  |  Total: ' . format_size($total_size) if $file_count;
+    return $desc;
+}
+
+sub extract_name {
+    my ($item) = @_;
+    $item =~ s/\t.*$//;  # strip everything after the tab separator
+    return $item;
 }
 
 sub format_size {
     my ($size) = @_;
     my @units = ('B', 'KB', 'MB', 'GB', 'TB');
-    my $unit_idx = 0;
-
-    while ($size >= 1024 && $unit_idx < $#units) {
-        $size /= 1024;
-        $unit_idx++;
-    }
-
-    return sprintf("%.2f %s", $size, $units[$unit_idx]);
+    my $u = 0;
+    while ($size >= 1024 && $u < $#units) { $size /= 1024; $u++ }
+    return sprintf("%.2f %s", $size, $units[$u]);
 }
 
 sub chunked_copy {
-    my ($src, $dest, $progress_window, $progress_canvas, $progress_rect, $progress_text, $bytes_done_ref, $total_bytes) = @_;
+    my ($src, $dest, $pw, $progress_label) = @_;
 
-    my $file_size = -s $src || 0;
+    warn "DEBUG chunked_copy: $src -> $dest\n";
+
     open(my $in,  '<:raw', $src)  or die "Cannot open $src: $!";
     open(my $out, '>:raw', $dest) or die "Cannot open $dest: $!";
 
-    my $chunk_size = 1024 * 1024;  # 1MB chunks
-    my $buf;
-
-    while (my $bytes = read($in, $buf, $chunk_size)) {
+    my ($buf, $total_bytes) = ('', 0);
+    while (my $bytes = read($in, $buf, 1024 * 1024)) {
         print $out $buf or die "Write failed: $!";
-        $$bytes_done_ref += $bytes;
-
-        if ($progress_canvas && $total_bytes > 0) {
-            my $pct       = int($$bytes_done_ref / $total_bytes * 100);
-            my $bar_width = int($pct / 100 * 500);
-            $progress_canvas->coords($progress_rect, 0, 0, $bar_width, 30);
-            $progress_canvas->itemconfigure($progress_text, -text => "$pct%");
-        }
-
-        $progress_window->update;
+        $total_bytes += $bytes;
+        warn "DEBUG  wrote $total_bytes bytes so far\n";
+        $pw->update;
     }
 
     close($in);
+
+    if ($progress_label) {
+        $progress_label->configure(-text => 'Flushing: ' . basename($dest));
+        $pw->update;
+    }
+
     close($out);
+    warn "DEBUG chunked_copy done: $total_bytes bytes total\n";
 }
 
 sub copy_directory_recursive {
-    my ($source_dir, $dest_dir, $progress_window, $file_label, $progress_canvas, $progress_rect, $progress_text, $bytes_done_ref, $total_bytes) = @_;
+    my ($src_dir, $dst_dir, $pw, $file_label, $progress_label) = @_;
 
-    # Create destination directory
-    make_path($dest_dir) unless -d $dest_dir;
+    make_path($dst_dir) unless -d $dst_dir;
 
-    # First pass: collect all items
-    my @all_items;
-    find(sub {
-        my $name = $File::Find::name;
-        return if $name eq $source_dir;
-        push @all_items, { src => $name, is_dir => (-d $name) ? 1 : 0 };
-    }, $source_dir);
+    opendir(my $dh, $src_dir) or die "Cannot read $src_dir: $!";
+    my @entries = grep { $_ ne '.' && $_ ne '..' } readdir($dh);
+    closedir($dh);
 
-    my $file_count = 0;
-    my $dir_count  = 0;
-
-    # Second pass: copy one item at a time, updating UI after each
-    foreach my $item (@all_items) {
-        my $source_file = $item->{src};
-        my $relative    = File::Spec->abs2rel($source_file, $source_dir);
-        my $dest_file   = File::Spec->catfile($dest_dir, $relative);
-
-        $file_label->configure(-text => "  $relative");
-        $progress_window->update;
-
-        if ($item->{is_dir}) {
-            make_path($dest_file) unless -d $dest_file;
-            $dir_count++;
+    my ($fc, $dc) = (0, 0);
+    foreach my $entry (@entries) {
+        my $src  = File::Spec->catfile($src_dir, $entry);
+        my $dest = File::Spec->catfile($dst_dir, $entry);
+        $file_label->configure(-text => "  $entry");
+        $pw->update;
+        if (-d $src) {
+            my ($f, $d) = copy_directory_recursive($src, $dest, $pw, $file_label, $progress_label);
+            $fc += $f;  $dc += $d + 1;
         } else {
-            chunked_copy($source_file, $dest_file,
-                         $progress_window, $progress_canvas, $progress_rect, $progress_text,
-                         $bytes_done_ref, $total_bytes);
-            $file_count++;
+            chunked_copy($src, $dest, $pw, $progress_label);
+            $fc++;
         }
     }
-
-    return ($file_count, $dir_count);
+    return ($fc, $dc);
 }
 
-sub copy_to_remote {
-    copy_files($local_listbox, $local_path, $remote_path, 'local', 'remote');
-}
-
-sub copy_to_local {
-    copy_files($remote_listbox, $remote_path, $local_path, 'remote', 'local');
-}
+sub copy_to_remote { copy_files($local_listbox,  $local_path,  $remote_path, 'local',  'remote') }
+sub copy_to_local  { copy_files($remote_listbox, $remote_path, $local_path,  'remote', 'local')  }
 
 sub copy_files {
-    my ($source_listbox, $source_path, $dest_path, $source_name, $dest_name) = @_;
+    my ($src_lb, $src_path, $dst_path, $src_name, $dst_name) = @_;
 
-    my @selection = $source_listbox->curselection();
-
-    unless (@selection) {
-        $mw->messageBox(
-            -title => 'No Selection',
-            -message => "Please select files from the $source_name pane to copy.",
-            -type => 'OK',
-            -icon => 'warning'
-        );
+    my @sel = $src_lb->curselection();
+    unless (@sel) {
+        $mw->messageBox(-title => 'No Selection',
+            -message => "Please select files from the $src_name pane.", -type => 'OK', -icon => 'warning');
+        return;
+    }
+    unless (-d $dst_path) {
+        $mw->messageBox(-title => 'Invalid Destination',
+            -message => "Destination directory does not exist:\n$dst_path", -type => 'OK', -icon => 'error');
         return;
     }
 
-    unless (-d $dest_path) {
-        $mw->messageBox(
-            -title => 'Invalid Destination',
-            -message => "Destination directory does not exist:\n$dest_path",
-            -type => 'OK',
-            -icon => 'error'
-        );
+    my @items;
+    my ($file_count, $dir_count) = (0, 0);
+    foreach my $idx (@sel) {
+        my $item  = extract_name($src_lb->get($idx));
+        next if $item eq '[..]';
+        my $clean = ($item =~ /^\[([^\]]+)\]/) ? $1 : $item;
+        my $fp    = File::Spec->catfile($src_path, $clean);
+        if    (-f $fp) { push @items, { path => $fp, type => 'file', name => $clean }; $file_count++ }
+        elsif (-d $fp) { push @items, { path => $fp, type => 'dir',  name => $clean }; $dir_count++  }
+    }
+
+    unless (@items) {
+        $mw->messageBox(-title => 'No Selection', -message => 'No valid files or directories selected.',
+            -type => 'OK', -icon => 'warning');
         return;
     }
 
-    my @items_to_copy;
-    my $file_count = 0;
-    my $dir_count = 0;
-
-    foreach my $idx (@selection) {
-        my $item = $source_listbox->get($idx);
-        next if $item eq '[..]';  # Skip parent directory entry
-
-        # Remove brackets from directory names
-        my $clean_name = $item;
-        if ($item =~ /^\[(.*)\]$/) {
-            $clean_name = $1;
-        }
-
-        my $filepath = File::Spec->catfile($source_path, $clean_name);
-        if (-f $filepath) {
-            push @items_to_copy, { path => $filepath, type => 'file', name => $clean_name };
-            $file_count++;
-        } elsif (-d $filepath) {
-            push @items_to_copy, { path => $filepath, type => 'dir', name => $clean_name };
-            $dir_count++;
-        }
-    }
-
-    unless (@items_to_copy) {
-        $mw->messageBox(
-            -title => 'No Selection',
-            -message => 'No valid files or directories selected.',
-            -type => 'OK',
-            -icon => 'warning'
-        );
-        return;
-    }
-
-    # Confirm copy operation
-    my $arrow = $source_name eq 'local' ? '>>>' : '<<<';
-    my $item_desc = '';
-    $item_desc .= "$file_count file(s)" if $file_count > 0;
-    $item_desc .= " and " if $file_count > 0 && $dir_count > 0;
-    $item_desc .= "$dir_count folder(s)" if $dir_count > 0;
+    my $arrow    = $src_name eq 'local' ? '>>>' : '<<<';
+    my $item_desc = join(' and ',
+        ($file_count ? "$file_count file(s)"   : ()),
+        ($dir_count  ? "$dir_count folder(s)"  : ()));
 
     my $confirm = $mw->messageBox(
-        -title => 'Confirm Copy',
-        -message => sprintf("Copy %s %s\n\nFrom: %s\nTo: %s\n\nProceed?",
-                           $item_desc, $arrow, $source_path, $dest_path),
-        -type => 'YesNo',
-        -icon => 'question'
+        -title   => 'Confirm Copy',
+        -message => sprintf("Copy %s %s\n\nFrom: %s\nTo:   %s\n\nProceed?",
+                            $item_desc, $arrow, $src_path, $dst_path),
+        -type    => 'YesNo',
+        -icon    => 'question',
     );
-
     return unless $confirm eq 'Yes';
 
-    # Create progress window
-    my $progress_window = $mw->Toplevel();
-    $progress_window->title("Copying Files $arrow");
-    $progress_window->geometry("550x180");
-    $progress_window->resizable(0, 0);
+    # ---------- Progress window ----------
+    my $pw = $mw->Toplevel();
+    $pw->title("Copying $arrow");
+    $pw->geometry("620x220");
+    $pw->resizable(0, 0);
+    $pw->configure(-bg => $C_BG);
 
-    my $progress_frame = $progress_window->Frame()->pack(-fill => 'both', -expand => 1, -padx => 20, -pady => 20);
+    my $pf = $pw->Frame(-bg => $C_PANEL)->pack(-fill => 'both', -expand => 1, -padx => 20, -pady => 16);
 
-    $progress_frame->Label(
-        -text => "From: $source_name",
+    $pf->Label(-text => "FROM  $src_name", -bg => $C_PANEL, -fg => $C_SUBTEXT, -font => $F_SMALL, -anchor => 'w')
+       ->pack(-fill => 'x');
+    $pf->Label(-text => "TO    $dst_name", -bg => $C_PANEL, -fg => $C_SUBTEXT, -font => $F_SMALL, -anchor => 'w')
+       ->pack(-fill => 'x', -pady => 4);
+
+    my $prog_label = $pf->Label(
+        -text   => 'Preparing...',
+        -bg     => $C_PANEL,
+        -fg     => $C_TEXT,
+        -font   => $F_BOLD,
         -anchor => 'w',
-        -fg => 'blue'
-    )->pack(-fill => 'x', -pady => 2);
+    )->pack(-fill => 'x');
 
-    $progress_frame->Label(
-        -text => "To: $dest_name",
+    my $file_label = $pf->Label(
+        -text   => '',
+        -bg     => $C_PANEL,
+        -fg     => $C_SUBTEXT,
+        -font   => $F_SMALL,
         -anchor => 'w',
-        -fg => 'darkgreen'
-    )->pack(-fill => 'x', -pady => 2);
+    )->pack(-fill => 'x', -pady => 4);
 
-    my $progress_label = $progress_frame->Label(
-        -text => 'Preparing to copy...',
-        -anchor => 'w',
-        -font => ['Arial', 9, 'bold']
-    )->pack(-fill => 'x', -pady => 5);
+    # Bouncing indeterminate progress bar
+    my $track = $pf->Canvas(
+        -width              => 560,
+        -height             => 28,
+        -bg                 => $C_CARD,
+        -relief             => 'flat',
+        -borderwidth        => 0,
+        -highlightthickness => 0,
+    )->pack(-pady => 4);
 
-    my $file_label = $progress_frame->Label(
-        -text => '',
-        -anchor => 'w',
-        -fg => 'blue'
-    )->pack(-fill => 'x', -pady => 5);
+    my $bar_color = $src_name eq 'local' ? '#1F6B3A' : '#8B2020';
+    my $bar_w     = 100;
+    my $track_w   = 560;
+    my $bar_x     = 0;
+    my $bar_dir   = 1;
+    my $rect      = $track->createRectangle(0, 0, $bar_w, 28, -fill => $bar_color, -outline => '');
+    my $anim_id;
 
-    my $progress_canvas = $progress_frame->Canvas(
-        -width => 500,
-        -height => 30,
-        -bg => 'white',
-        -relief => 'sunken',
-        -borderwidth => 2
-    )->pack(-pady => 10);
+    my $animate;
+    $animate = sub {
+        $bar_x += $bar_dir * 10;
+        if ($bar_x + $bar_w >= $track_w) { $bar_x = $track_w - $bar_w; $bar_dir = -1 }
+        if ($bar_x <= 0)                 { $bar_x = 0;                  $bar_dir =  1 }
+        $track->coords($rect, $bar_x, 0, $bar_x + $bar_w, 28);
+        $anim_id = $pw->after(40, $animate);
+    };
+    $animate->();
 
-    my $progress_rect = $progress_canvas->createRectangle(
-        0, 0, 0, 30,
-        -fill => ($source_name eq 'local' ? 'green' : 'red'),
-        -outline => ''
-    );
+    $pw->update;
 
-    my $progress_text = $progress_canvas->createText(
-        250, 15,
-        -text => '0%',
-        -font => ['Arial', 10, 'bold']
-    );
+    # ---------- Copy loop ----------
+    $status_label->configure(-text => "  Copy In Progress...", -fg => '#E0A030');
+    $mw->update;
 
-    # Calculate total bytes across all items (including directory contents)
-    my $total_bytes = 0;
-    for my $item (@items_to_copy) {
-        if ($item->{type} eq 'file') {
-            $total_bytes += -s $item->{path} || 0;
-        } elsif ($item->{type} eq 'dir') {
-            find(sub { $total_bytes += -f $_ ? (-s $_) : 0 }, $item->{path});
-        }
-    }
-    $total_bytes ||= 1;  # avoid division by zero
+    my $flash_on = 1;
+    my $flash_id;
+    my $flash;
+    $flash = sub {
+        $flash_on = !$flash_on;
+        $status_label->configure(-text => $flash_on ? "  Copy In Progress..." : "");
+        $flash_id = $mw->after(500, $flash);
+    };
+    $flash_id = $mw->after(500, $flash);
 
-    # Perform the copy
-    my $success_count = 0;
-    my $fail_count    = 0;
-    my @errors;
-    my $total_items = scalar(@items_to_copy);
-    my $bytes_done  = 0;
+    warn "DEBUG copy_files: " . scalar(@items) . " item(s) to copy -> $dst_path\n";
+    my ($ok, $fail, @errors) = (0, 0, ());
 
-    foreach my $i (0 .. $#items_to_copy) {
-        my $item      = $items_to_copy[$i];
-        my $source    = $item->{path};
-        my $item_name = $item->{name};
-        my $dest      = File::Spec->catfile($dest_path, $item_name);
+    for my $i (0 .. $#items) {
+        my $item  = $items[$i];
+        my $dest  = File::Spec->catfile($dst_path, $item->{name});
+        warn "DEBUG item ${\($i+1)}: $item->{type} $item->{path} -> $dest\n";
+        my $label = $item->{type} eq 'dir' ? 'folder' : 'file';
 
-        my $type_label = $item->{type} eq 'dir' ? 'folder' : 'file';
-        $progress_label->configure(-text => sprintf("Copying %s %d of %d...", $type_label, $i + 1, $total_items));
-        $file_label->configure(-text => $item_name);
-        $status_label->configure(-text => "Copying $item_name...");
-        $progress_window->update;
+        $prog_label->configure(-text => sprintf("Copying %s %d / %d:  %s", $label, $i+1, scalar @items, $item->{name}));
+        $file_label->configure(-text => "  $item->{name}");
+        $pw->update;
+        $mw->update;
 
         eval {
             if ($item->{type} eq 'file') {
-                chunked_copy($source, $dest,
-                             $progress_window, $progress_canvas, $progress_rect, $progress_text,
-                             \$bytes_done, $total_bytes);
-            } elsif ($item->{type} eq 'dir') {
-                my ($files, $dirs) = copy_directory_recursive($source, $dest,
-                             $progress_window, $file_label,
-                             $progress_canvas, $progress_rect, $progress_text,
-                             \$bytes_done, $total_bytes);
+                chunked_copy($item->{path}, $dest, $pw, $prog_label);
+            } else {
+                copy_directory_recursive($item->{path}, $dest, $pw, $file_label, $prog_label);
             }
-            $success_count++;
+            $ok++;
         };
         if ($@) {
-            $fail_count++;
-            my $error = $@;
-            warn "ERROR: Failed to copy $item_name: $error\n";
-            push @errors, "$item_name: $error";
+            $fail++;
+            push @errors, "$item->{name}: $@";
+            warn "ERROR: $item->{name}: $@\n";
         }
     }
 
-    # Final progress update
-    $progress_canvas->coords($progress_rect, 0, 0, 500, 30);
-    $progress_canvas->itemconfigure($progress_text, -text => "100%");
-    $progress_label->configure(-text => "Copy complete!");
-    $progress_window->update;
+    $pw->afterCancel($anim_id) if $anim_id;
+    $track->coords($rect, 0, 0, $track_w, 28);
+    $prog_label->configure(-text => 'Copy complete!');
+    $pw->update;
+    $pw->destroy;
 
-    # Close progress window after a brief pause
-    $progress_window->after(1000, sub { $progress_window->destroy; });
-
-    # Show results
-    my $msg = "Copy completed!\n\n";
-    $msg .= "Success: $success_count file(s)\n";
-    $msg .= "Failed: $fail_count file(s)\n";
-
-    if (@errors) {
-        $msg .= "\nErrors:\n" . join("\n", @errors);
-    }
+    my $msg = "Copy completed!\n\nSuccess: $ok\nFailed:  $fail";
+    $msg   .= "\n\nErrors:\n" . join("\n", @errors) if @errors;
 
     $mw->messageBox(
-        -title => 'Copy Complete',
+        -title   => 'Copy Complete',
         -message => $msg,
-        -type => 'OK',
-        -icon => $fail_count > 0 ? 'warning' : 'info'
+        -type    => 'OK',
+        -icon    => $fail > 0 ? 'warning' : 'info',
     );
 
-    $status_label->configure(-text => "Copy completed: $success_count success, $fail_count failed");
+    $mw->afterCancel($flash_id) if $flash_id;
+    $status_label->configure(
+        -text => "Copy done — $ok succeeded, $fail failed",
+        -fg   => $fail > 0 ? '#C05050' : $C_STATUS_OK,
+    );
 
-    # Refresh destination pane
-    if ($source_name eq 'local') {
-        refresh_remote_list();
-    } else {
-        refresh_local_list();
-    }
+    if ($src_name eq 'local') { refresh_remote_list() } else { refresh_local_list() }
 }
 
-# Start the GUI
+# Defer BrowseEntry foreground fixes until after the event loop initializes all widgets.
+$mw->after(1, sub {
+    browse_entry_fg($share_entry,      $C_SHARE_FG);
+    browse_entry_fg($local_sort_entry, $C_SORT_FG);
+    browse_entry_fg($remote_sort_entry,$C_SORT_FG);
+});
+
 MainLoop;
