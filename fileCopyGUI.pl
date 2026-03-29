@@ -1078,9 +1078,7 @@ $mw->after(1, sub {
 });
 
 $mw->protocol('WM_DELETE_WINDOW', sub {
-    unmount_share($selected_share) if $selected_share && is_mounted($shares{$selected_share}{mount});
-    unmount_share('tim-movies');
-    unmount_share('tim-shows');
+    unmount_share($_) for keys %shares;
     $mw->destroy;
 });
 
