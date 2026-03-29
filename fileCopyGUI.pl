@@ -157,7 +157,7 @@ my $remote_start_path = '';
 my $local_sort        = 'Date (Newest)';
 my $remote_sort       = 'Date (Newest)';
 
-my ($local_listbox, $remote_listbox, $local_info, $remote_info, $status_label);
+my ($local_listbox, $remote_listbox, $local_info, $remote_info, $local_disk_info, $remote_disk_info, $status_label);
 
 # ---------------------------------------------------------------------------
 # Helper: styled button
@@ -319,6 +319,17 @@ make_button($local_sort_frame,
     -command => \&refresh_local_list,
 )->pack(-side => 'left');
 
+# Local disk info bar
+$local_disk_info = $left_pane->Label(
+    -text   => '',
+    -bg     => $C_PANEL,
+    -fg     => $C_STATUS_FG,
+    -font   => $F_SMALL,
+    -anchor => 'w',
+    -pady   => 2,
+    -padx   => 10,
+)->pack(-side => 'top', -fill => 'x');
+
 # Local listbox
 $local_listbox = $left_pane->Scrolled('Listbox',
     -scrollbars       => 'osoe',
@@ -465,6 +476,17 @@ make_button($remote_sort_frame,
     -command => \&refresh_remote_list,
 )->pack(-side => 'left');
 
+# Remote disk info bar
+$remote_disk_info = $right_pane->Label(
+    -text   => '',
+    -bg     => $C_PANEL,
+    -fg     => $C_STATUS_FG,
+    -font   => $F_SMALL,
+    -anchor => 'w',
+    -pady   => 2,
+    -padx   => 10,
+)->pack(-side => 'top', -fill => 'x');
+
 # Remote listbox
 $remote_listbox = $right_pane->Scrolled('Listbox',
     -scrollbars       => 'osoe',
@@ -525,6 +547,10 @@ refresh_local_list();
 # ===========================================================================
 # Subroutines
 # ===========================================================================
+
+sub is_vpn_connected {
+    -d '/sys/class/net/tun0';
+}
 
 sub is_mounted {
     my ($mount_point) = @_;
@@ -621,6 +647,38 @@ sub unmount_share {
     }
 }
 
+sub update_remote_disk_info {
+    unless ($remote_path && -d $remote_path) {
+        $remote_disk_info->configure(-text => '', -fg => $C_STATUS_FG) if $remote_disk_info;
+        return;
+    }
+
+    my $df;
+    eval { $df = capture('df', '-BG', $remote_path) };
+    if ($@ || !$df) {
+        $remote_disk_info->configure(-text => '', -fg => $C_STATUS_FG);
+        return;
+    }
+
+    my @lines = split /\n/, $df;
+    if (@lines >= 2) {
+        my @f = split /\s+/, $lines[1];
+        my ($total, $used, $avail, $pct) = ($f[1], $f[2], $f[3], $f[4]);
+        s/G// for $total, $used, $avail;
+        $pct =~ s/%//;
+        my $color = $pct >= 90 ? '#C05050'
+                  : $pct >= 75 ? '#C09030'
+                  :               $C_STATUS_OK;
+        my $warn  = $pct >= 90 ? '  ** LOW DISK SPACE **'
+                  : $pct >= 75 ? '  * disk filling up'
+                  :               '';
+        $remote_disk_info->configure(
+            -text => "Disk: ${avail}G free of ${total}G  (${pct}% used)$warn",
+            -fg   => $color,
+        );
+    }
+}
+
 sub load_remote_share {
     return unless $selected_share;
 
@@ -634,6 +692,39 @@ sub load_remote_share {
     $remote_path       = $mount_point;
     $remote_start_path = $mount_point;
     refresh_remote_list();
+    update_remote_disk_info();
+}
+
+sub update_local_disk_info {
+    unless ($local_path && -d $local_path) {
+        $local_disk_info->configure(-text => '', -fg => $C_STATUS_FG) if $local_disk_info;
+        return;
+    }
+
+    my $df;
+    eval { $df = capture('df', '-BG', $local_path) };
+    if ($@ || !$df) {
+        $local_disk_info->configure(-text => '', -fg => $C_STATUS_FG);
+        return;
+    }
+
+    my @lines = split /\n/, $df;
+    if (@lines >= 2) {
+        my @f = split /\s+/, $lines[1];
+        my ($total, $used, $avail, $pct) = ($f[1], $f[2], $f[3], $f[4]);
+        s/G// for $total, $used, $avail;
+        $pct =~ s/%//;
+        my $color = $pct >= 90 ? '#C05050'
+                  : $pct >= 75 ? '#C09030'
+                  :               $C_STATUS_OK;
+        my $warn  = $pct >= 90 ? '  ** LOW DISK SPACE **'
+                  : $pct >= 75 ? '  * disk filling up'
+                  :               '';
+        $local_disk_info->configure(
+            -text => "Disk: ${avail}G free of ${total}G  (${pct}% used)$warn",
+            -fg   => $color,
+        );
+    }
 }
 
 sub refresh_local_list {
@@ -648,6 +739,7 @@ sub refresh_local_list {
     populate_local_listbox($local_listbox, $local_path, $local_sort, $dirs_only);
     $status_label->configure(-text => "Local sorted by: $local_sort", -fg => $C_STATUS_OK);
     update_local_info();
+    update_local_disk_info();
 }
 
 sub refresh_remote_list {
@@ -1078,6 +1170,16 @@ $mw->after(1, sub {
 });
 
 $mw->protocol('WM_DELETE_WINDOW', sub {
+    unless (is_vpn_connected()) {
+        my $ans = $mw->messageBox(
+            -title   => 'VPN Not Connected',
+            -message => "Torgard VPN is not connected.\n\nClose anyway?",
+            -type    => 'YesNo',
+            -icon    => 'warning',
+            -default => 'no',
+        );
+        return unless lc($ans) eq 'yes';
+    }
     unmount_share($_) for keys %shares;
     $mw->destroy;
 });
