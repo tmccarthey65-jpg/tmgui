@@ -2,3 +2,14 @@ plex_config.py
 *.bak
 *.gemini
 shares.json
+
+# Remote mount points
+DennisMovies/
+DennisShows/
+MikeMovies/
+MikeShows/
+MomMovies/
+MomShows/
+TimMovies/
+TimShows/
+Archive/

@@ -108,6 +108,13 @@ my $json_text  = read_file('/home/timmccarthey/Public/shares.json');
 my $shares_ref = decode_json($json_text);
 my %shares     = %{$shares_ref};
 
+# Aggregate virtual shares: mount/copy to all members simultaneously.
+# The first member is the "representative" shown in the remote pane.
+my %aggregate_shares = (
+    'movies-all' => [qw(mom-movies dennis-movies mike-movies)],
+    'shows-all'  => [qw(mom-shows  dennis-shows  mike-shows)],
+);
+
 my $mount_opts_template = join(',',
     'credentials=CREDS',
     'iocharset=utf8',
@@ -206,7 +213,7 @@ my $share_entry = $toolbar->BrowseEntry(
     -variable => \$selected_share,
     -state    => 'readonly',
     -width    => 22,
-    -choices  => [sort keys %shares],
+    -choices  => [sort(keys %shares, keys %aggregate_shares)],
     -browsecmd => \&load_remote_share,
     -bg       => $C_CARD,
     -fg       => $C_SHARE_FG,
@@ -647,40 +654,75 @@ sub unmount_share {
     }
 }
 
+sub _df_summary {
+    my ($path, $label) = @_;
+    return undef unless $path && -d $path;
+    my $df;
+    eval { $df = capture('df', '-BG', $path) };
+    return undef if $@ || !$df;
+    my @lines = split /\n/, $df;
+    return undef unless @lines >= 2;
+    my @f = split /\s+/, $lines[1];
+    my ($avail, $pct) = ($f[3], $f[4]);
+    $avail =~ s/G//;
+    $pct   =~ s/%//;
+    my $warn = $pct >= 90 ? ' !!' : $pct >= 75 ? ' !' : '';
+    return { text => "$label: ${avail}G free (${pct}%)$warn", pct => $pct };
+}
+
 sub update_remote_disk_info {
     unless ($remote_path && -d $remote_path) {
         $remote_disk_info->configure(-text => '', -fg => $C_STATUS_FG) if $remote_disk_info;
         return;
     }
 
-    my $df;
-    eval { $df = capture('df', '-BG', $remote_path) };
-    if ($@ || !$df) {
-        $remote_disk_info->configure(-text => '', -fg => $C_STATUS_FG);
+    if (exists $aggregate_shares{$selected_share}) {
+        my @members = @{$aggregate_shares{$selected_share}};
+        my @labels  = map { ucfirst((split /-/, $_)[0]) } @members;  # "mom" -> "Mom"
+        my @results;
+        my $worst_pct = 0;
+        for my $i (0 .. $#members) {
+            my $r = _df_summary($shares{$members[$i]}{mount}, $labels[$i]);
+            push @results, $r ? $r->{text} : "$labels[$i]: unavailable";
+            $worst_pct = $r->{pct} if $r && $r->{pct} > $worst_pct;
+        }
+        my $color = $worst_pct >= 90 ? '#C05050'
+                  : $worst_pct >= 75 ? '#C09030'
+                  :                     $C_STATUS_OK;
+        $remote_disk_info->configure(
+            -text => join('  |  ', @results),
+            -fg   => $color,
+        );
         return;
     }
 
-    my @lines = split /\n/, $df;
-    if (@lines >= 2) {
-        my @f = split /\s+/, $lines[1];
-        my ($total, $used, $avail, $pct) = ($f[1], $f[2], $f[3], $f[4]);
-        s/G// for $total, $used, $avail;
-        $pct =~ s/%//;
-        my $color = $pct >= 90 ? '#C05050'
-                  : $pct >= 75 ? '#C09030'
-                  :               $C_STATUS_OK;
-        my $warn  = $pct >= 90 ? '  ** LOW DISK SPACE **'
-                  : $pct >= 75 ? '  * disk filling up'
-                  :               '';
-        $remote_disk_info->configure(
-            -text => "Disk: ${avail}G free of ${total}G  (${pct}% used)$warn",
-            -fg   => $color,
-        );
+    my $r = _df_summary($remote_path, 'Disk');
+    if ($r) {
+        my $color = $r->{pct} >= 90 ? '#C05050'
+                  : $r->{pct} >= 75 ? '#C09030'
+                  :                    $C_STATUS_OK;
+        $remote_disk_info->configure(-text => $r->{text}, -fg => $color);
+    } else {
+        $remote_disk_info->configure(-text => '', -fg => $C_STATUS_FG);
     }
 }
 
 sub load_remote_share {
     return unless $selected_share;
+
+    if (exists $aggregate_shares{$selected_share}) {
+        my @members = @{$aggregate_shares{$selected_share}};
+        for my $name (@members) {
+            mount_share($name) unless is_mounted($shares{$name}{mount});
+        }
+        my $rep_mount = $shares{$members[0]}{mount};
+        return unless is_mounted($rep_mount);
+        $remote_path       = $rep_mount;
+        $remote_start_path = $rep_mount;
+        refresh_remote_list();
+        update_remote_disk_info();
+        return;
+    }
 
     my $mount_point = $shares{$selected_share}{mount};
 
@@ -759,14 +801,40 @@ sub refresh_remote_list {
     warn "DEBUG refresh_remote_list: -d check passed in " . (time()-$t0) . "s\n";
 
     my $dirs_only = ($remote_start_path && $remote_path eq $remote_start_path) ? 1 : 0;
-    populate_local_listbox($remote_listbox, $remote_path, $remote_sort, $dirs_only);
+
+    # For aggregate shares, build the intersection of directories that exist
+    # across all member mounts at every level, not just the root.
+    my $common_dirs;
+    if (exists $aggregate_shares{$selected_share}) {
+        my @members   = @{$aggregate_shares{$selected_share}};
+        my $rep_mount = $shares{$members[0]}{mount};
+        my $rel       = File::Spec->abs2rel($remote_path, $rep_mount);
+
+        my %intersection;
+        my $first = 1;
+        for my $name (@members) {
+            my $mpath = ($rel eq '.') ? $shares{$name}{mount}
+                                      : File::Spec->catfile($shares{$name}{mount}, $rel);
+            next unless -d $mpath;
+            opendir(my $mdh, $mpath) or next;
+            my %mdirs = map { $_ => 1 }
+                grep { $_ ne '.' && $_ ne '..' && -d File::Spec->catfile($mpath, $_) }
+                readdir($mdh);
+            closedir($mdh);
+            if ($first) { %intersection = %mdirs; $first = 0 }
+            else        { %intersection = map { $_ => 1 } grep { exists $intersection{$_} } keys %mdirs }
+        }
+        $common_dirs = \%intersection;
+    }
+
+    populate_local_listbox($remote_listbox, $remote_path, $remote_sort, $dirs_only, $common_dirs);
     warn "DEBUG refresh_remote_list: done in " . (time()-$t0) . "s total\n";
     $status_label->configure(-text => "Remote sorted by: $remote_sort", -fg => $C_STATUS_OK);
     update_remote_info();
 }
 
 sub populate_local_listbox {
-    my ($listbox, $path, $sort_by, $dirs_only) = @_;
+    my ($listbox, $path, $sort_by, $dirs_only, $allowed_dirs) = @_;
     $sort_by ||= 'Name';
 
     warn "DEBUG populate_local_listbox: opendir $path\n";
@@ -793,6 +861,7 @@ sub populate_local_listbox {
     }
 
     my @dirs  = grep { $stat_cache{$_} && $stat_cache{$_}{is_dir} } keys %stat_cache;
+    @dirs     = grep { $allowed_dirs->{$_} } @dirs if $allowed_dirs;
     my @files = $dirs_only ? () : grep { $stat_cache{$_} && !$stat_cache{$_}{is_dir} } keys %stat_cache;
     my @all   = (@dirs, @files);
     warn "DEBUG populate_local_listbox: stat pass done (" . scalar(@dirs) . " dirs, " . scalar(@files) . " files) in " . (time()-$t0) . "s\n";
@@ -857,7 +926,9 @@ sub navigate_remote {
 
     if ($item eq '[..]') {
         my $parent     = dirname($remote_path);
-        my $mount_root = $shares{$selected_share}{mount};
+        my $mount_root = exists $aggregate_shares{$selected_share}
+            ? $shares{$aggregate_shares{$selected_share}[0]}{mount}
+            : $shares{$selected_share}{mount};
         if ($parent && $parent ne $remote_path && length($parent) >= length($mount_root)) {
             $remote_path = $parent;
             refresh_remote_list();
@@ -921,6 +992,83 @@ sub format_size {
     my $u = 0;
     while ($size >= 1024 && $u < $#units) { $size /= 1024; $u++ }
     return sprintf("%.2f %s", $size, $units[$u]);
+}
+
+# For an aggregate share, expand a destination path (rooted at the representative
+# mount) into the equivalent path under each member's mount point.
+sub get_aggregate_dests {
+    my ($dst_path) = @_;
+    return ($dst_path) unless exists $aggregate_shares{$selected_share};
+    my @members   = @{$aggregate_shares{$selected_share}};
+    my $rep_mount = $shares{$members[0]}{mount};
+    my $rel       = File::Spec->abs2rel($dst_path, $rep_mount);
+    return map { File::Spec->catfile($shares{$_}{mount}, $rel) } @members;
+}
+
+# Read source file once, write to multiple destinations simultaneously.
+# Destinations where the file already exists are silently skipped.
+sub chunked_copy_multi {
+    my ($src, $dests_ref, $pw, $progress_label) = @_;
+
+    my @needed = grep { !-e $_ } @$dests_ref;
+    my @skipped = grep { -e $_ } @$dests_ref;
+    warn "DEBUG chunked_copy_multi: $src -> " . join(', ', @needed) . "\n";
+    warn "DEBUG chunked_copy_multi: skipping (already exists): " . join(', ', @skipped) . "\n" if @skipped;
+
+    return unless @needed;   # all destinations already have the file
+
+    open(my $in, '<:raw', encode_utf8($src)) or die "Cannot open $src: $!";
+
+    my @outs;
+    for my $dest (@needed) {
+        open(my $fh, '>:raw', encode_utf8($dest)) or die "Cannot open $dest: $!";
+        push @outs, $fh;
+    }
+
+    my ($buf, $total_bytes) = ('', 0);
+    while (my $bytes = read($in, $buf, 1024 * 1024)) {
+        print $_ $buf or die "Write failed: $!" for @outs;
+        $total_bytes += $bytes;
+        $pw->update;
+    }
+    close($in);
+
+    if ($progress_label) {
+        $progress_label->configure(-text => 'Flushing: ' . basename($src));
+        $pw->update;
+    }
+    close($_) for @outs;
+    warn "DEBUG chunked_copy_multi done: $total_bytes bytes\n";
+}
+
+# Recursively copy a directory to multiple destinations, reading each source
+# file only once.
+sub copy_directory_recursive_multi {
+    my ($src_dir, $dst_dirs_ref, $pw, $file_label, $progress_label) = @_;
+    make_path($_) for grep { !-d $_ } @$dst_dirs_ref;
+
+    opendir(my $dh, $src_dir) or die "Cannot read $src_dir: $!";
+    my @entries = grep { $_ ne '.' && $_ ne '..' } readdir($dh);
+    closedir($dh);
+
+    my ($fc, $dc) = (0, 0);
+    for my $entry (@entries) {
+        my $src        = File::Spec->catfile($src_dir, $entry);
+        my @all_dests  = map { File::Spec->catfile($_, $entry) } @$dst_dirs_ref;
+        $file_label->configure(-text => "  $entry");
+        $pw->update;
+        if (-d $src) {
+            # For subdirectories, recurse into all destinations (new files may
+            # be missing even if the directory itself already exists).
+            my ($f, $d) = copy_directory_recursive_multi($src, \@all_dests, $pw, $file_label, $progress_label);
+            $fc += $f; $dc += $d + 1;
+        } else {
+            # chunked_copy_multi already skips destinations where the file exists.
+            chunked_copy_multi($src, \@all_dests, $pw, $progress_label);
+            $fc++;
+        }
+    }
+    return ($fc, $dc);
 }
 
 sub chunked_copy {
@@ -1016,10 +1164,18 @@ sub copy_files {
         ($file_count ? "$file_count file(s)"   : ()),
         ($dir_count  ? "$dir_count folder(s)"  : ()));
 
+    my $dest_desc;
+    if ($src_name eq 'local' && exists $aggregate_shares{$selected_share}) {
+        my @all_dests = get_aggregate_dests($dst_path);
+        $dest_desc = "(${\scalar @all_dests} destinations):\n      " . join("\n      ", @all_dests);
+    } else {
+        $dest_desc = $dst_path;
+    }
+
     my $confirm = $mw->messageBox(
         -title   => 'Confirm Copy',
         -message => sprintf("Copy %s %s\n\nFrom: %s\nTo:   %s\n\nProceed?",
-                            $item_desc, $arrow, $src_path, $dst_path),
+                            $item_desc, $arrow, $src_path, $dest_desc),
         -type    => 'YesNo',
         -icon    => 'question',
     );
@@ -1103,9 +1259,10 @@ sub copy_files {
     my ($ok, $fail, @errors) = (0, 0, ());
 
     for my $i (0 .. $#items) {
-        my $item  = $items[$i];
-        my $dest  = File::Spec->catfile($dst_path, $item->{name});
-        warn "DEBUG item ${\($i+1)}: $item->{type} $item->{path} -> $dest\n";
+        my $item     = $items[$i];
+        my $base_dest = File::Spec->catfile($dst_path, $item->{name});
+        my @dests    = ($src_name eq 'local') ? get_aggregate_dests($base_dest) : ($base_dest);
+        warn "DEBUG item ${\($i+1)}: $item->{type} $item->{path} -> " . join(', ', @dests) . "\n";
         my $label = $item->{type} eq 'dir' ? 'folder' : 'file';
 
         $prog_label->configure(-text => sprintf("Copying %s %d / %d:  %s", $label, $i+1, scalar @items, $item->{name}));
@@ -1115,9 +1272,17 @@ sub copy_files {
 
         eval {
             if ($item->{type} eq 'file') {
-                chunked_copy($item->{path}, $dest, $pw, $prog_label);
+                if (@dests > 1) {
+                    chunked_copy_multi($item->{path}, \@dests, $pw, $prog_label);
+                } else {
+                    chunked_copy($item->{path}, $dests[0], $pw, $prog_label);
+                }
             } else {
-                copy_directory_recursive($item->{path}, $dest, $pw, $file_label, $prog_label);
+                if (@dests > 1) {
+                    copy_directory_recursive_multi($item->{path}, \@dests, $pw, $file_label, $prog_label);
+                } else {
+                    copy_directory_recursive($item->{path}, $dests[0], $pw, $file_label, $prog_label);
+                }
             }
             $ok++;
         };
