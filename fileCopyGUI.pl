@@ -115,6 +115,11 @@ my %aggregate_shares = (
     'shows-all'  => [qw(mom-shows  dennis-shows  mike-shows)],
 );
 
+# Local drives: already OS-managed mounts — no sudo mount/umount needed.
+my %local_drives = (
+    'bigstorage' => '/run/media/timmccarthey/BIGSTORAGE',
+);
+
 my $mount_opts_template = join(',',
     'credentials=CREDS',
     'iocharset=utf8',
@@ -163,6 +168,7 @@ my $remote_path       = '';
 my $remote_start_path = '';
 my $local_sort        = 'Date (Newest)';
 my $remote_sort       = 'Date (Newest)';
+our $overwrite_files   = 0;
 
 my ($local_listbox, $remote_listbox, $local_info, $remote_info, $local_disk_info, $remote_disk_info, $status_label);
 
@@ -213,7 +219,7 @@ my $share_entry = $toolbar->BrowseEntry(
     -variable => \$selected_share,
     -state    => 'readonly',
     -width    => 22,
-    -choices  => [sort(keys %shares, keys %aggregate_shares)],
+    -choices  => [sort(keys %shares, keys %aggregate_shares, keys %local_drives)],
     -browsecmd => \&load_remote_share,
     -bg       => $C_CARD,
     -fg       => $C_SHARE_FG,
@@ -232,6 +238,20 @@ make_button($toolbar,
     -text    => 'Refresh Both',
     -command => sub { refresh_local_list(); refresh_remote_list(); },
 )->pack(-side => 'left', -padx => 2, -pady => 10);
+
+$toolbar->Checkbutton(
+    -text             => 'Overwrite Existing',
+    -variable         => \$overwrite_files,
+    -bg               => $C_PANEL,
+    -fg               => $C_TEXT,
+    -activebackground => $C_PANEL,
+    -selectcolor      => $C_HDR_LOCAL,
+    -font             => $F_SMALL,
+    -command          => sub {
+        my $msg = $overwrite_files ? "Overwrite ENABLED" : "Overwrite DISABLED";
+        $status_label->configure(-text => "  $msg", -fg => $C_STATUS_OK);
+    },
+)->pack(-side => 'left', -padx => 10, -pady => 10);
 
 # App title on the right
 $toolbar->Label(
@@ -710,6 +730,25 @@ sub update_remote_disk_info {
 sub load_remote_share {
     return unless $selected_share;
 
+    if (exists $local_drives{$selected_share}) {
+        my $path = $local_drives{$selected_share};
+        unless (-d $path) {
+            $status_label->configure(-text => "Drive not found: $path", -fg => '#C05050');
+            $mw->messageBox(
+                -title   => 'Drive Not Available',
+                -message => "Could not access '$selected_share'.\nCheck that the drive is plugged in.",
+                -type    => 'OK',
+                -icon    => 'error',
+            );
+            return;
+        }
+        $remote_path       = $path;
+        $remote_start_path = $path;
+        refresh_remote_list();
+        update_remote_disk_info();
+        return;
+    }
+
     if (exists $aggregate_shares{$selected_share}) {
         my @members = @{$aggregate_shares{$selected_share}};
         for my $name (@members) {
@@ -1006,16 +1045,23 @@ sub get_aggregate_dests {
 }
 
 # Read source file once, write to multiple destinations simultaneously.
-# Destinations where the file already exists are silently skipped.
+# Destinations where the file already exists are skipped unless $overwrite_files is true.
 sub chunked_copy_multi {
     my ($src, $dests_ref, $pw, $progress_label) = @_;
 
-    my @needed = grep { !-e $_ } @$dests_ref;
-    my @skipped = grep { -e $_ } @$dests_ref;
+    warn "DEBUG chunked_copy_multi: overwrite_files=$overwrite_files\n";
+    my @needed  = $overwrite_files ? @$dests_ref : grep { !-e $_ } @$dests_ref;
+    my @skipped = $overwrite_files ? ()           : grep { -e $_ } @$dests_ref;
     warn "DEBUG chunked_copy_multi: $src -> " . join(', ', @needed) . "\n";
     warn "DEBUG chunked_copy_multi: skipping (already exists): " . join(', ', @skipped) . "\n" if @skipped;
 
-    return unless @needed;   # all destinations already have the file
+    return -1 unless @needed;   # all destinations already have the file
+
+    # Ensure parent directories exist for all destinations
+    for my $dest (@needed) {
+        my $dir = dirname($dest);
+        make_path($dir) unless -d $dir;
+    }
 
     open(my $in, '<:raw', encode_utf8($src)) or die "Cannot open $src: $!";
 
@@ -1039,6 +1085,7 @@ sub chunked_copy_multi {
     }
     close($_) for @outs;
     warn "DEBUG chunked_copy_multi done: $total_bytes bytes\n";
+    return 1;
 }
 
 # Recursively copy a directory to multiple destinations, reading each source
@@ -1074,7 +1121,16 @@ sub copy_directory_recursive_multi {
 sub chunked_copy {
     my ($src, $dest, $pw, $progress_label) = @_;
 
+    warn "DEBUG chunked_copy: overwrite_files=$overwrite_files\n";
+    if (!$overwrite_files && -e $dest) {
+        warn "DEBUG chunked_copy: skipping $dest (already exists)\n";
+        return -1;
+    }
+
     warn "DEBUG chunked_copy: $src -> $dest\n";
+
+    my $dir = dirname($dest);
+    make_path($dir) unless -d $dir;
 
     open(my $in,  '<:raw', encode_utf8($src))  or die "Cannot open $src: $!";
     open(my $out, '>:raw', encode_utf8($dest)) or die "Cannot open $dest: $!";
@@ -1096,6 +1152,7 @@ sub chunked_copy {
 
     close($out);
     warn "DEBUG chunked_copy done: $total_bytes bytes total\n";
+    return 1;
 }
 
 sub copy_directory_recursive {
@@ -1130,6 +1187,8 @@ sub copy_to_local  { copy_files($remote_listbox, $remote_path, $local_path,  're
 sub copy_files {
     my ($src_lb, $src_path, $dst_path, $src_name, $dst_name) = @_;
 
+    my $current_overwrite = $overwrite_files;
+    warn "DEBUG copy_files: overwrite_files=$overwrite_files (captured as $current_overwrite)\n";
     my @sel = $src_lb->curselection();
     unless (@sel) {
         $mw->messageBox(-title => 'No Selection',
@@ -1164,6 +1223,9 @@ sub copy_files {
         ($file_count ? "$file_count file(s)"   : ()),
         ($dir_count  ? "$dir_count folder(s)"  : ()));
 
+    my $over_msg = $current_overwrite ? "OVERWRITE: ENABLED (Existing files will be replaced)" 
+                                    : "OVERWRITE: DISABLED (Existing files will be skipped)";
+
     my $dest_desc;
     if ($src_name eq 'local' && exists $aggregate_shares{$selected_share}) {
         my @all_dests = get_aggregate_dests($dst_path);
@@ -1174,8 +1236,8 @@ sub copy_files {
 
     my $confirm = $mw->messageBox(
         -title   => 'Confirm Copy',
-        -message => sprintf("Copy %s %s\n\nFrom: %s\nTo:   %s\n\nProceed?",
-                            $item_desc, $arrow, $src_path, $dest_desc),
+        -message => sprintf("Copy %s %s\n\nFrom: %s\nTo:   %s\n\n%s\n\nProceed?",
+                            $item_desc, $arrow, $src_path, $dest_desc, $over_msg),
         -type    => 'YesNo',
         -icon    => 'question',
     );
@@ -1256,7 +1318,7 @@ sub copy_files {
     $flash_id = $mw->after(500, $flash);
 
     warn "DEBUG copy_files: " . scalar(@items) . " item(s) to copy -> $dst_path\n";
-    my ($ok, $fail, @errors) = (0, 0, ());
+    my ($ok, $fail, $skipped_count, @errors) = (0, 0, 0, ());
 
     for my $i (0 .. $#items) {
         my $item     = $items[$i];
@@ -1270,21 +1332,29 @@ sub copy_files {
         $pw->update;
         $mw->update;
 
+        # Set the global to the captured state for the duration of this item
+        local $overwrite_files = $current_overwrite;
+
         eval {
+            my $res = 0;
             if ($item->{type} eq 'file') {
                 if (@dests > 1) {
-                    chunked_copy_multi($item->{path}, \@dests, $pw, $prog_label);
+                    $res = chunked_copy_multi($item->{path}, \@dests, $pw, $prog_label);
                 } else {
-                    chunked_copy($item->{path}, $dests[0], $pw, $prog_label);
+                    $res = chunked_copy($item->{path}, $dests[0], $pw, $prog_label);
                 }
             } else {
                 if (@dests > 1) {
-                    copy_directory_recursive_multi($item->{path}, \@dests, $pw, $file_label, $prog_label);
+                    my ($f, $d) = copy_directory_recursive_multi($item->{path}, \@dests, $pw, $file_label, $prog_label);
+                    $res = ($f > 0 || $d > 0) ? 1 : -1;
                 } else {
-                    copy_directory_recursive($item->{path}, $dests[0], $pw, $file_label, $prog_label);
+                    my ($f, $d) = copy_directory_recursive($item->{path}, $dests[0], $pw, $file_label, $prog_label);
+                    $res = ($f > 0 || $d > 0) ? 1 : -1;
                 }
             }
-            $ok++;
+            if ($res > 0) { $ok++ }
+            elsif ($res < 0) { $skipped_count++ }
+            else { $ok++ }
         };
         if ($@) {
             $fail++;
@@ -1299,7 +1369,7 @@ sub copy_files {
     $pw->update;
     $pw->destroy;
 
-    my $msg = "Copy completed!\n\nSuccess: $ok\nFailed:  $fail";
+    my $msg = "Copy completed!\n\nSuccess: $ok\nSkipped: $skipped_count\nFailed:  $fail";
     $msg   .= "\n\nErrors:\n" . join("\n", @errors) if @errors;
 
     $mw->messageBox(
