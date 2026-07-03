@@ -437,6 +437,12 @@ $mw->after(100, sub {
     mount_share('tim-movies');
     mount_share('tim-shows');
 
+    log_message("Cleaning empty folders in TimMovies...", 'info');
+    clean_empty_directories('/home/timmccarthey/Public/TimMovies');
+
+    log_message("Cleaning empty folders in TimShows...", 'info');
+    clean_empty_directories('/home/timmccarthey/Public/TimShows');
+
     log_message("Updating Plex CSV exports (running plex_export.py)...", 'info');
     my $export_output = `python3 /home/timmccarthey/Public/plex_export.py 2>&1`;
     if ($? == 0) {
@@ -1230,5 +1236,40 @@ sub unmount_share {
         log_message("Successfully unmounted: $name", 'success');
     } else {
         log_message("Error: Unmount failed for $name", 'error');
+    }
+}
+
+sub clean_empty_directories {
+    my ($root) = @_;
+    return unless -d $root;
+    
+    my @empty_dirs;
+    find({
+        bydepth => 1,
+        wanted  => sub {
+            my $dir = $File::Find::name;
+            return unless -d $dir;
+            return if $dir eq $root;
+
+            opendir(my $dh, $dir) or return;
+            my @entries = grep { $_ ne '.' && $_ ne '..' } readdir($dh);
+            closedir($dh);
+
+            push @empty_dirs, $dir if @entries == 0;
+        },
+    }, $root);
+    
+    if (@empty_dirs) {
+        log_message("Found " . scalar(@empty_dirs) . " empty folder(s) under $root. Cleaning...", 'info');
+        for my $dir (@empty_dirs) {
+            log_message("  Removing empty folder: $dir", 'warning');
+            if (rmdir($dir)) {
+                log_message("    Removed successfully.", 'success');
+            } else {
+                log_message("    Failed to remove: $!", 'error');
+            }
+        }
+    } else {
+        log_message("No empty folders found under $root.", 'success');
     }
 }
