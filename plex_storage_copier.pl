@@ -2,6 +2,7 @@
 
 use strict;
 use warnings;
+use utf8;
 use Tk;
 use File::Basename;
 use File::Spec;
