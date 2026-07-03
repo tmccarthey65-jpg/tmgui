@@ -82,8 +82,9 @@ my $stats_var  = 'Loading...';
 my $progress_var = 'Ready';
 my $overwrite_files = 0;
 
-my $sort_col     = 'title';
-my $sort_order   = 'asc';
+my $sort_col     = 'added';
+my $sort_order   = 'desc';
+my $blink_timer;
 
 # Selection details variables
 my $detail_title_var = '';
@@ -216,7 +217,7 @@ my $header_frame = $mw->Frame(
 )->pack(-side => 'top', -fill => 'x', -padx => 18, -pady => '5 0');
 
 my $title_hdr_lbl = $header_frame->Label(
-    -text   => " Title ▲",
+    -text   => " Title",
     -font   => $F_MONO,
     -bg     => $C_BG,
     -fg     => $C_SUBTEXT,
@@ -236,7 +237,7 @@ my $year_hdr_lbl = $header_frame->Label(
 )->pack(-side => 'left');
 
 my $added_hdr_lbl = $header_frame->Label(
-    -text   => "Added",
+    -text   => "Added ▼",
     -font   => $F_MONO,
     -bg     => $C_BG,
     -fg     => $C_SUBTEXT,
@@ -435,6 +436,7 @@ $log_text->tagConfigure('info',    -foreground => '#60A5FA');
 log_message("Plex Storage Copier Initialized.", 'info');
 
 $mw->after(100, sub {
+    start_blinking();
     mount_share('tim-movies');
     mount_share('tim-shows');
 
@@ -445,14 +447,23 @@ $mw->after(100, sub {
     clean_empty_directories('/home/timmccarthey/Public/TimShows');
 
     log_message("Updating Plex CSV exports (running plex_export.py)...", 'info');
-    my $export_output = `python3 /home/timmccarthey/Public/plex_export.py 2>&1`;
-    if ($? == 0) {
-        log_message("Plex export completed successfully.", 'success');
-    } else {
-        log_message("Error running plex_export.py:\n$export_output", 'error');
-    }
-
-    refresh_all();
+    open(my $ph, "python3 -u /home/timmccarthey/Public/plex_export.py 2>&1 |") or die "Can't fork: $!";
+    $mw->fileevent($ph, 'readable', sub {
+        if (defined(my $line = <$ph>)) {
+            chomp $line;
+            log_message($line, 'normal');
+        } else {
+            $mw->fileevent($ph, 'readable', '');
+            close($ph);
+            if ($? == 0) {
+                log_message("Plex export completed successfully.", 'success');
+            } else {
+                log_message("Error running plex_export.py (exit code $?)", 'error');
+            }
+            stop_blinking();
+            refresh_all();
+        }
+    });
 });
 
 $mw->protocol('WM_DELETE_WINDOW', sub {
@@ -988,6 +999,7 @@ sub refresh_all {
     }
     
     update_items_status();
+    update_header_labels();
     update_list();
     clear_details();
     
@@ -1273,4 +1285,22 @@ sub clean_empty_directories {
     } else {
         log_message("No empty folders found under $root.", 'success');
     }
+}
+
+sub start_blinking {
+    $blink_timer = $mw->repeat(500, sub {
+        if ($progress_var eq 'Ready') {
+            $progress_var = '';
+        } else {
+            $progress_var = 'Ready';
+        }
+    });
+}
+
+sub stop_blinking {
+    if (defined $blink_timer) {
+        $blink_timer->cancel;
+        undef $blink_timer;
+    }
+    $progress_var = 'Ready';
 }
