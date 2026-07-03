@@ -1144,6 +1144,16 @@ sub run_copy_process {
     my $total_items = scalar(@items_to_copy);
     my $current_item = 0;
     
+    my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+    my $timestamp = sprintf("%04d-%02d-%02d %02d:%02d:%02d", $year+1900, $mon+1, $mday, $hour, $min, $sec);
+
+    my @log_lines;
+    push @log_lines, "================================================================================";
+    push @log_lines, "COPY SESSION START: $timestamp";
+    push @log_lines, "Total Items: $total_items";
+    push @log_lines, "Overwrite: " . ($overwrite_files ? "YES" : "NO");
+    push @log_lines, "--------------------------------------------------------------------------------";
+
     log_message("Starting copy process for $total_items item(s)...", 'info');
     
     for my $item (@items_to_copy) {
@@ -1158,15 +1168,20 @@ sub run_copy_process {
         log_message("  Dest:   $dst");
         $mw->update;
         
+        my $status_str = "SUCCESS";
         if (!-d $src) {
             log_message("  Error: Source folder does not exist: $src", 'error');
             $failed_count++;
+            $status_str = "FAILED (Source does not exist)";
+            push @log_lines, "[-] '$title' -> $dst | $status_str";
             next;
         }
         
         if (!$overwrite_files && -d $dst) {
             log_message("  Skipped: Destination already exists (Overwrite is off).", 'normal');
             $skipped_count++;
+            $status_str = "SKIPPED (Destination already exists)";
+            push @log_lines, "[~] '$title' -> $dst | $status_str";
             next;
         }
         
@@ -1178,7 +1193,9 @@ sub run_copy_process {
         if ($@) {
             log_message("  Error copying directory: $@", 'error');
             $failed_count++;
+            $status_str = "FAILED ($@)";
         }
+        push @log_lines, ($status_str eq 'SUCCESS' ? '[+]' : '[-]') . " '$title' -> $dst | $status_str";
     }
     
     # Rescan and refresh UI status
@@ -1188,6 +1205,21 @@ sub run_copy_process {
     
     $progress_var = "Finished: $success_count successful, $skipped_count skipped, $failed_count failed.";
     log_message("Copy finished. Success: $success_count, Skipped: $skipped_count, Failed: $failed_count.", 'success');
+
+    push @log_lines, "--------------------------------------------------------------------------------";
+    my ($esec,$emin,$ehour,$emday,$emon,$eyear) = localtime(time);
+    push @log_lines, "COPY SESSION END: " . sprintf("%04d-%02d-%02d %02d:%02d:%02d", $eyear+1900, $emon+1, $emday, $ehour, $emin, $esec);
+    push @log_lines, "Summary: Success: $success_count, Skipped: $skipped_count, Failed: $failed_count";
+    push @log_lines, "================================================================================\n";
+
+    my $log_file = "/home/timmccarthey/Public/copy_log.txt";
+    if (open(my $fh, '>>', $log_file)) {
+        print $fh join("\n", @log_lines) . "\n";
+        close($fh);
+        log_message("Log file updated: $log_file", 'info');
+    } else {
+        log_message("Error writing to log file $log_file: $!", 'error');
+    }
     
     $copy_button->configure(-state => 'normal', -text => 'COPY SELECTED TO BIGSTORAGE');
     $mw->update;
