@@ -8,7 +8,7 @@ use File::Basename;
 use File::Find;
 use File::Spec;
 use File::Path qw(make_path);
-use Encode qw(encode_utf8);
+use Encode qw(encode_utf8 decode_utf8);
 use JSON;
 use File::Slurp;
 use IPC::System::Simple qw(capture);
@@ -925,10 +925,10 @@ sub populate_local_listbox {
 
     foreach my $item (@sorted) {
         if ($stat_cache{$item}{is_dir}) {
-            $listbox->insert('end', "[$item]\t  <DIR>");
+            $listbox->insert('end', decode_utf8("[$item]\t  <DIR>"));
         } else {
             my $size = format_size($stat_cache{$item}{size} || 0);
-            $listbox->insert('end', "$item\t  $size");
+            $listbox->insert('end', decode_utf8("$item\t  $size"));
         }
     }
 
@@ -1022,7 +1022,7 @@ sub get_selection_info {
 sub extract_name {
     my ($item) = @_;
     $item =~ s/\t.*$//;  # strip everything after the tab separator
-    return $item;
+    return encode_utf8($item);
 }
 
 sub format_size {
@@ -1063,11 +1063,11 @@ sub chunked_copy_multi {
         make_path($dir) unless -d $dir;
     }
 
-    open(my $in, '<:raw', encode_utf8($src)) or die "Cannot open $src: $!";
+    open(my $in, '<:raw', $src) or die "Cannot open $src: $!";
 
     my @outs;
     for my $dest (@needed) {
-        open(my $fh, '>:raw', encode_utf8($dest)) or die "Cannot open $dest: $!";
+        open(my $fh, '>:raw', $dest) or die "Cannot open $dest: $!";
         push @outs, $fh;
     }
 
@@ -1080,7 +1080,7 @@ sub chunked_copy_multi {
     close($in);
 
     if ($progress_label) {
-        $progress_label->configure(-text => 'Flushing: ' . basename($src));
+        $progress_label->configure(-text => decode_utf8('Flushing: ' . basename($src)));
         $pw->update;
     }
     close($_) for @outs;
@@ -1102,7 +1102,7 @@ sub copy_directory_recursive_multi {
     for my $entry (@entries) {
         my $src        = File::Spec->catfile($src_dir, $entry);
         my @all_dests  = map { File::Spec->catfile($_, $entry) } @$dst_dirs_ref;
-        $file_label->configure(-text => "  $entry");
+        $file_label->configure(-text => decode_utf8("  $entry"));
         $pw->update;
         if (-d $src) {
             # For subdirectories, recurse into all destinations (new files may
@@ -1132,8 +1132,8 @@ sub chunked_copy {
     my $dir = dirname($dest);
     make_path($dir) unless -d $dir;
 
-    open(my $in,  '<:raw', encode_utf8($src))  or die "Cannot open $src: $!";
-    open(my $out, '>:raw', encode_utf8($dest)) or die "Cannot open $dest: $!";
+    open(my $in,  '<:raw', $src)  or die "Cannot open $src: $!";
+    open(my $out, '>:raw', $dest) or die "Cannot open $dest: $!";
 
     my ($buf, $total_bytes) = ('', 0);
     while (my $bytes = read($in, $buf, 1024 * 1024)) {
@@ -1146,7 +1146,7 @@ sub chunked_copy {
     close($in);
 
     if ($progress_label) {
-        $progress_label->configure(-text => 'Flushing: ' . basename($dest));
+        $progress_label->configure(-text => decode_utf8('Flushing: ' . basename($dest)));
         $pw->update;
     }
 
@@ -1168,7 +1168,7 @@ sub copy_directory_recursive {
     foreach my $entry (@entries) {
         my $src  = File::Spec->catfile($src_dir, $entry);
         my $dest = File::Spec->catfile($dst_dir, $entry);
-        $file_label->configure(-text => "  $entry");
+        $file_label->configure(-text => decode_utf8("  $entry"));
         $pw->update;
         if (-d $src) {
             my ($f, $d) = copy_directory_recursive($src, $dest, $pw, $file_label, $progress_label);
@@ -1187,6 +1187,9 @@ sub copy_to_local  { copy_files($remote_listbox, $remote_path, $local_path,  're
 sub copy_files {
     my ($src_lb, $src_path, $dst_path, $src_name, $dst_name) = @_;
 
+    my $src_path_bytes = encode_utf8($src_path);
+    my $dst_path_bytes = encode_utf8($dst_path);
+
     my $current_overwrite = $overwrite_files;
     warn "DEBUG copy_files: overwrite_files=$overwrite_files (captured as $current_overwrite)\n";
     my @sel = $src_lb->curselection();
@@ -1195,7 +1198,7 @@ sub copy_files {
             -message => "Please select files from the $src_name pane.", -type => 'OK', -icon => 'warning');
         return;
     }
-    unless (-d $dst_path) {
+    unless (-d $dst_path_bytes) {
         $mw->messageBox(-title => 'Invalid Destination',
             -message => "Destination directory does not exist:\n$dst_path", -type => 'OK', -icon => 'error');
         return;
@@ -1207,7 +1210,7 @@ sub copy_files {
         my $item  = extract_name($src_lb->get($idx));
         next if $item eq '[..]';
         my $clean = ($item =~ /^\[([^\]]+)\]/) ? $1 : $item;
-        my $fp    = File::Spec->catfile($src_path, $clean);
+        my $fp    = File::Spec->catfile($src_path_bytes, $clean);
         if    (-f $fp) { push @items, { path => $fp, type => 'file', name => $clean }; $file_count++ }
         elsif (-d $fp) { push @items, { path => $fp, type => 'dir',  name => $clean }; $dir_count++  }
     }
@@ -1228,8 +1231,8 @@ sub copy_files {
 
     my $dest_desc;
     if ($src_name eq 'local' && exists $aggregate_shares{$selected_share}) {
-        my @all_dests = get_aggregate_dests($dst_path);
-        $dest_desc = "(${\scalar @all_dests} destinations):\n      " . join("\n      ", @all_dests);
+        my @all_dests = get_aggregate_dests($dst_path_bytes);
+        $dest_desc = "(${\scalar @all_dests} destinations):\n      " . join("\n      ", map { decode_utf8($_) } @all_dests);
     } else {
         $dest_desc = $dst_path;
     }
@@ -1322,13 +1325,13 @@ sub copy_files {
 
     for my $i (0 .. $#items) {
         my $item     = $items[$i];
-        my $base_dest = File::Spec->catfile($dst_path, $item->{name});
+        my $base_dest = File::Spec->catfile($dst_path_bytes, $item->{name});
         my @dests    = ($src_name eq 'local') ? get_aggregate_dests($base_dest) : ($base_dest);
         warn "DEBUG item ${\($i+1)}: $item->{type} $item->{path} -> " . join(', ', @dests) . "\n";
         my $label = $item->{type} eq 'dir' ? 'folder' : 'file';
 
-        $prog_label->configure(-text => sprintf("Copying %s %d / %d:  %s", $label, $i+1, scalar @items, $item->{name}));
-        $file_label->configure(-text => "  $item->{name}");
+        $prog_label->configure(-text => decode_utf8(sprintf("Copying %s %d / %d:  %s", $label, $i+1, scalar @items, $item->{name})));
+        $file_label->configure(-text => decode_utf8("  $item->{name}"));
         $pw->update;
         $mw->update;
 
