@@ -1,5 +1,8 @@
 plex_config.py
+botfile.conf
+.tmdb-api-key
 *.bak
+*.bk
 *.gemini
 shares.json
 
