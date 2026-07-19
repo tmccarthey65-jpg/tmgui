@@ -166,7 +166,16 @@ sub clean_query {
     my $search_year = "";
     my @years = $name =~ /\b((?:19|20)\d{2})\b/g;
     if (@years) {
-        $search_year = $years[-1];
+        my $current_year = (localtime)[5] + 1900;
+        my $found_valid = 0;
+        for my $y (reverse @years) {
+            if ($y >= 1888 && $y <= $current_year + 1) {
+                $search_year = $y;
+                $found_valid = 1;
+                last;
+            }
+        }
+        $search_year = $years[-1] unless $found_valid;
         # Everything from the year onward is almost always release metadata.
         $name =~ s/\b\Q$search_year\E\b.*$//;
     }
